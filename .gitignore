@@ -1,0 +1,26 @@
+# Binaries and object files
+*.exe
+*.o
+*.obj
+*.out
+*.a
+*.so
+*.dll
+
+# Build directories
+build/
+bin/
+
+# Test data artifacts
+test_data/*.bin
+!test_data/sample_file.bin
+results/*.csv
+results/*.png
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
