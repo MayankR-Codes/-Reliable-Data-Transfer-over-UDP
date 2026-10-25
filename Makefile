@@ -10,7 +10,7 @@ TEST_DIR = tests
 OBJS_COMMON = $(SRC_DIR)/packet.o $(SRC_DIR)/socket_utils.o
 
 # Target executables
-TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe
+TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe
 
 all: $(TARGETS)
 
@@ -27,6 +27,9 @@ test_loopback.exe: $(TEST_DIR)/test_udp_loopback.c $(OBJS_COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test_emulator.exe: $(TEST_DIR)/test_emulator_forwarding.c $(OBJS_COMMON)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test_loss.exe: $(TEST_DIR)/test_emulator_loss.c $(OBJS_COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test: all
