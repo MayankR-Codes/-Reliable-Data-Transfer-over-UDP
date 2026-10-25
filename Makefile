@@ -7,10 +7,10 @@ INC_DIR = include
 TEST_DIR = tests
 
 # Object files
-OBJS_COMMON = $(SRC_DIR)/packet.o $(SRC_DIR)/socket_utils.o
+OBJS_COMMON = $(SRC_DIR)/packet.o $(SRC_DIR)/socket_utils.o $(SRC_DIR)/file_io.o
 
 # Target executables
-TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe
+TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe test_file_io.exe
 
 all: $(TARGETS)
 
@@ -32,11 +32,16 @@ test_emulator.exe: $(TEST_DIR)/test_emulator_forwarding.c $(OBJS_COMMON)
 test_loss.exe: $(TEST_DIR)/test_emulator_loss.c $(OBJS_COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+test_file_io.exe: $(TEST_DIR)/test_file_io.c $(OBJS_COMMON)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 test: all
 	@echo Running test_packet...
 	@./test_packet.exe
 	@echo Running test_loopback...
 	@./test_loopback.exe
+	@echo Running test_file_io...
+	@./test_file_io.exe
 	@echo Running test_emulator...
 	@./test_emulator.exe
 	@echo Running test_loss...
