@@ -1,7 +1,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include "socket_utils.h"
+#if defined(__has_include)
+  #if __has_include("../include/socket_utils.h")
+    #include "../include/socket_utils.h"
+  #elif __has_include("socket_utils.h")
+    #include "socket_utils.h"
+  #endif
+#else
+  #include "socket_utils.h"
+#endif
 
 int main(void) {
     printf("=========================================\n");

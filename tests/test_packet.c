@@ -1,7 +1,15 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include "packet.h"
+#if defined(__has_include)
+  #if __has_include("../include/packet.h")
+    #include "../include/packet.h"
+  #elif __has_include("packet.h")
+    #include "packet.h"
+  #endif
+#else
+  #include "packet.h"
+#endif
 
 int main(void) {
     printf("=========================================\n");

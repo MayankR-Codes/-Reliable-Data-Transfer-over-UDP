@@ -1,7 +1,46 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
-#include "socket_utils.h"
+#if defined(__has_include)
+  #if __has_include("../include/socket_utils.h")
+    #include "../include/socket_utils.h"
+  #elif __has_include("socket_utils.h")
+    #include "socket_utils.h"
+  #endif
+#else
+  #include "socket_utils.h"
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+static PROCESS_INFORMATION emu_pi;
+static int started_local_emulator = 0;
+
+static void try_launch_emulator_loss(void) {
+    STARTUPINFO si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&emu_pi, sizeof(emu_pi));
+
+    char cmd[] = "emulator.exe --listen 8000 --recv-port 9001 --loss 25";
+    if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &emu_pi)) {
+        started_local_emulator = 1;
+        Sleep(400); /* Wait for emulator process to bind port 8000 */
+    }
+}
+
+static void stop_local_emulator(void) {
+    if (started_local_emulator) {
+        TerminateProcess(emu_pi.hProcess, 0);
+        CloseHandle(emu_pi.hProcess);
+        CloseHandle(emu_pi.hThread);
+        started_local_emulator = 0;
+    }
+}
+#else
+static void try_launch_emulator_loss(void) {}
+static void stop_local_emulator(void) {}
+#endif
 
 int main(void) {
     printf("====================================================\n");
@@ -14,10 +53,13 @@ int main(void) {
     int recv_port = 9001;
     int num_packets = 50;
 
+    /* Auto-launch emulator with loss if not already running */
+    try_launch_emulator_loss();
+
     /* 1. Setup Receiver */
     SOCKET recv_sock = create_udp_socket();
     assert(bind_udp_socket(recv_sock, recv_port) == 0);
-    set_socket_timeout(recv_sock, 1500); /* 1.5s timeout */
+    set_socket_timeout(recv_sock, 1500);
 
     /* 2. Setup Sender */
     SOCKET send_sock = create_udp_socket();
@@ -69,6 +111,7 @@ int main(void) {
     assert(fin_rx.type == PACKET_FIN);
     printf("[3] FIN packet successfully passed through emulator!\n");
 
+    stop_local_emulator();
     CLOSE_SOCKET(send_sock);
     CLOSE_SOCKET(recv_sock);
     cleanup_network();

@@ -37,6 +37,10 @@ test: all
 	@./test_packet.exe
 	@echo Running test_loopback...
 	@./test_loopback.exe
+	@echo Running test_emulator...
+	@./test_emulator.exe
+	@echo Running test_loss...
+	@./test_loss.exe
 
 ifeq ($(OS),Windows_NT)
 clean:
