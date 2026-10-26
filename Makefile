@@ -10,7 +10,7 @@ TEST_DIR = tests
 OBJS_COMMON = $(SRC_DIR)/packet.o $(SRC_DIR)/socket_utils.o $(SRC_DIR)/file_io.o
 
 # Target executables
-TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe test_file_io.exe
+TARGETS = emulator.exe test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe test_file_io.exe test_delay.exe
 
 all: $(TARGETS)
 
@@ -35,6 +35,9 @@ test_loss.exe: $(TEST_DIR)/test_emulator_loss.c $(OBJS_COMMON)
 test_file_io.exe: $(TEST_DIR)/test_file_io.c $(OBJS_COMMON)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+test_delay.exe: $(TEST_DIR)/test_emulator_delay.c $(OBJS_COMMON)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 test: all
 	@echo Running test_packet...
 	@./test_packet.exe
@@ -46,6 +49,8 @@ test: all
 	@./test_emulator.exe
 	@echo Running test_loss...
 	@./test_loss.exe
+	@echo Running test_delay...
+	@./test_delay.exe
 
 ifeq ($(OS),Windows_NT)
 clean:
