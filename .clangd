@@ -1,0 +1,11 @@
+CompileFlags:
+  Add:
+    - -Iinclude
+    - -I../include
+    - -IC:/MinGW/include
+    - -IC:/MinGW/lib/gcc/mingw32/6.3.0/include
+    - -Wall
+    - -Wextra
+    - -D_WIN32
+    - -DWIN32
+  Compiler: C:/MinGW/bin/gcc.exe
