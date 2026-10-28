@@ -1,7 +1,7 @@
 /*
  * test_packet.c
  * =============
- * Author  : Manisha Behera (Day 1 Task — Manisha & Raushan)
+ * Authors : Manisha Behera & Raushan Kumar (Day 1 Task)
  * Purpose : Test packet initialization, checksum computation,
  *           single-bit corruption detection, and header-tampering
  *           detection using the CRC32 implementation in packet.c.
@@ -30,7 +30,7 @@ int main(void) {
 
     printf("\n");
     printf("=======================================================\n");
-    printf("  Manisha Behera — Day 1: Packet & Checksum Tests\n");
+    printf("  Manisha & Raushan — Day 1: Packet & Checksum Tests\n");
     printf("=======================================================\n\n");
 
     /* ─────────────────────────────────────────────────────────── */
@@ -151,7 +151,7 @@ int main(void) {
     /* ─────────────────────────────────────────────────────────── */
     printf("=======================================================\n");
     if (all_passed)
-        printf("  ALL 8 TESTS PASSED — Manisha Day 1 Complete!\n");
+        printf("  ALL 8 TESTS PASSED — Manisha & Raushan Day 1 Complete!\n");
     else
         printf("  SOME TESTS FAILED — Review output above.\n");
     printf("=======================================================\n\n");

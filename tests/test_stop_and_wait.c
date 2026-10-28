@@ -1,21 +1,22 @@
 /*
  * test_stop_and_wait.c
  * ====================
- * Author  : Manisha Behera (Day 2 Test)
+ * Authors : Manisha Behera & Raushan Kumar (Day 2 Test)
  * Purpose : End-to-end test of the Stop-and-Wait ARQ protocol.
  *
  * Strategy:
- *   1. Generate a small in-memory test file (test_data/sw_input.bin).
- *   2. Launch sw_receiver() in a background Windows thread.
+ *   1. Generate small in-memory test file (test_data/sw_input.bin).
+ *   2. Launch sw_receiver() in a background thread.
  *   3. Call sw_sender() in the main thread to transfer the file.
- *   4. Wait for both to complete.
- *   5. Compute SHA-256 of input and output files and assert they match.
+ *   4. Wait for both to complete and assert SHA-256 integrity.
+ *   5. Prepare dummy 5 MB test file (test_data/input_5mb.bin) per Raushan Day 2 task.
+ *   6. Perform full 5 MB file transfer and assert 100% SHA-256 matching.
  *
  * Day 2 Spec:
  *   - Full file transfer works using Stop-and-Wait.
  *   - Running sha256 on input and output produces identical hashes.
- *   - SW successfully recovers if packets are manually dropped (emulated
- *     here by the 200 ms timeout / retransmit mechanism).
+ *   - Stop-and-Wait transfers input_5mb.bin, Receiver writes output_5mb.bin.
+ *   - SW successfully recovers if packets are manually dropped (200 ms timeout).
  */
 
 #include <stdio.h>
@@ -39,6 +40,11 @@
 #define SW_INPUT_FILE     "test_data/sw_input.bin"
 #define SW_OUTPUT_FILE    "test_data/sw_output.bin"
 #define SW_TEST_FILE_SIZE (5 * 1024)   /* 5 KB — quick smoke test    */
+
+#define SW_5MB_PORT       19201
+#define SW_5MB_INPUT_FILE  "test_data/input_5mb.bin"
+#define SW_5MB_OUTPUT_FILE "test_data/output_5mb.bin"
+#define SW_5MB_SIZE        (5 * 1024 * 1024)  /* 5 MB — Raushan Day 2 Spec */
 
 /* ── Helper: print pass/fail ────────────────────────────────────── */
 static void banner(const char *test_name, int passed) {
@@ -93,7 +99,7 @@ int main(void) {
 
     printf("\n");
     printf("=======================================================\n");
-    printf("  Manisha Behera — Day 2: Stop-and-Wait ARQ Tests\n");
+    printf("  Manisha & Raushan — Day 2: Stop-and-Wait ARQ Tests\n");
     printf("=======================================================\n\n");
 
     /* ─────────────────────────────────────────────────────────── */
@@ -199,11 +205,85 @@ int main(void) {
     printf("\n");
 
     /* ─────────────────────────────────────────────────────────── */
+    /* TEST 6: Raushan Day 2: Prepare dummy 5 MB test file        */
+    /* ─────────────────────────────────────────────────────────── */
+    printf("[TEST 6] Raushan Day 2: Creating 5 MB test file (%d bytes)\n",
+           SW_5MB_SIZE);
+    ok = (create_test_file(SW_5MB_INPUT_FILE, SW_5MB_SIZE) == 0);
+    banner("Raushan 5 MB test file created successfully", ok);
+    assert(ok);
+    all_passed &= ok;
+
+    char input_5mb_hash[SHA256_HEX_LEN] = {0};
+    ok = (compute_file_sha256(SW_5MB_INPUT_FILE, input_5mb_hash) == 0);
+    printf("  5 MB Input SHA-256 : %s\n", input_5mb_hash);
+    banner("5 MB Input SHA-256 computed", ok);
+    assert(ok);
+    all_passed &= ok;
+    printf("\n");
+
+    /* ─────────────────────────────────────────────────────────── */
+    /* TEST 7: Stop-and-Wait 5 MB transfer                        */
+    /* ─────────────────────────────────────────────────────────── */
+    printf("[TEST 7] Transferring 5 MB file via Stop-and-Wait (port %d)...\n",
+           SW_5MB_PORT);
+    ReceiverArgs rargs_5mb = { SW_5MB_PORT, SW_5MB_OUTPUT_FILE, -99 };
+
+#ifdef _WIN32
+    HANDLE hThread5mb = (HANDLE)_beginthreadex(
+        NULL, 0, receiver_thread, &rargs_5mb, 0, NULL);
+    assert(hThread5mb != NULL);
+    Sleep(300);
+#else
+    pthread_t tid5mb;
+    pthread_create(&tid5mb, NULL, receiver_thread, &rargs_5mb);
+    usleep(300000);
+#endif
+
+    int sret_5mb = sw_sender(SW_5MB_INPUT_FILE, "127.0.0.1", SW_5MB_PORT);
+
+#ifdef _WIN32
+    WaitForSingleObject(hThread5mb, 30000);
+    CloseHandle(hThread5mb);
+#else
+    pthread_join(tid5mb, NULL);
+#endif
+
+    ok = (sret_5mb == 0 && rargs_5mb.result == 0);
+    banner("5 MB Stop-and-Wait transfer completed successfully", ok);
+    assert(ok);
+    all_passed &= ok;
+    printf("\n");
+
+    /* ─────────────────────────────────────────────────────────── */
+    /* TEST 8: 5 MB File SHA-256 Integrity & Size Verification    */
+    /* ─────────────────────────────────────────────────────────── */
+    printf("[TEST 8] 5 MB File SHA-256 Integrity Verification\n");
+    char output_5mb_hash[SHA256_HEX_LEN] = {0};
+    int hash_ok_5mb = (compute_file_sha256(SW_5MB_OUTPUT_FILE, output_5mb_hash) == 0);
+    ok = hash_ok_5mb && (strcmp(input_5mb_hash, output_5mb_hash) == 0);
+    long out_sz_5mb = get_file_size(SW_5MB_OUTPUT_FILE);
+
+    printf("  Input  5MB SHA-256 : %s\n", input_5mb_hash);
+    printf("  Output 5MB SHA-256 : %s\n", output_5mb_hash);
+    printf("  Output 5MB size    : %ld bytes (expected: %d)\n", out_sz_5mb, SW_5MB_SIZE);
+
+    banner("5 MB SHA-256 hashes match identically (100%% data integrity)", ok);
+    assert(ok);
+    all_passed &= ok;
+
+    int size_match_5mb = (out_sz_5mb == (long)SW_5MB_SIZE);
+    banner("5 MB Output file size matches input exactly", size_match_5mb);
+    assert(size_match_5mb);
+    all_passed &= size_match_5mb;
+    printf("\n");
+
+    /* ─────────────────────────────────────────────────────────── */
     /* SUMMARY                                                    */
     /* ─────────────────────────────────────────────────────────── */
     printf("=======================================================\n");
     if (all_passed)
-        printf("  ALL 5 SW TESTS PASSED — Manisha Day 2 Complete!\n");
+        printf("  ALL 8 SW TESTS PASSED — Manisha & Raushan Day 2 Complete!\n");
     else
         printf("  SOME TESTS FAILED — Review output above.\n");
     printf("=======================================================\n\n");

@@ -1,16 +1,16 @@
 /*
  * stop_and_wait.c
  * ===============
- * Author  : Manisha Behera
+ * Authors : Manisha Behera & Raushan Kumar
  * Day     : 2 — File Chunking & Stop-and-Wait (SW) Protocol
  *
  * Implements the complete Stop-and-Wait ARQ protocol:
  *
  *   sw_sender()   — reads any file in 1024-byte chunks, sends each
  *                   chunk as a PACKET_DATA datagram, waits for an ACK
- *                   with a 200 ms socket timeout, and retransmits on
- *                   timeout.  seq_num alternates 0 ↔ 1 (1-bit SW).
- *                   Closes the session with PACKET_FIN.
+ *                   with a 200 ms socket timeout (SO_RCVTIMEO / select()),
+ *                   and retransmits on timeout.  seq_num alternates 0 ↔ 1
+ *                   (1-bit SW). Closes the session with PACKET_FIN.
  *
  *   sw_receiver() — listens for PACKET_DATA, validates CRC32,
  *                   writes valid in-order chunks to the output file,
