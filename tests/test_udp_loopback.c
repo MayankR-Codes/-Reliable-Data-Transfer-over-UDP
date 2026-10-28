@@ -1,7 +1,7 @@
 /*
  * test_udp_loopback.c
  * ===================
- * Author  : Manisha Behera (Day 1 Task — Manisha & Raushan)
+ * Authors : Manisha Behera & Raushan Kumar (Day 1 Task)
  * Purpose : Test raw UDP send/receive between two localhost ports,
  *           verifying that the packet arrives intact with matching
  *           checksum, sequence number, and payload content.
@@ -29,7 +29,7 @@ int main(void) {
 
     printf("\n");
     printf("=======================================================\n");
-    printf("  Manisha Behera — Day 1: UDP Loopback Tests\n");
+    printf("  Manisha & Raushan — Day 1: UDP Loopback Tests\n");
     printf("=======================================================\n\n");
 
     /* Initialise Winsock (no-op on Linux) */
@@ -173,7 +173,7 @@ int main(void) {
     /* ── Summary ────────────────────────────────────────────── */
     printf("=======================================================\n");
     if (all_passed)
-        printf("  ALL 7 UDP LOOPBACK TESTS PASSED — Manisha Day 1!\n");
+        printf("  ALL 7 UDP LOOPBACK TESTS PASSED — Manisha & Raushan Day 1!\n");
     else
         printf("  SOME TESTS FAILED — Review output above.\n");
     printf("=======================================================\n\n");

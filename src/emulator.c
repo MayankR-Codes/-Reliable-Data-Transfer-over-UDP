@@ -5,15 +5,55 @@
 #include "socket_utils.h"
 
 /* =========================================================
-   Platform-portable millisecond sleep
+   Platform-portable millisecond clock
    ========================================================= */
 #ifdef _WIN32
     #include <windows.h>
-    static void sleep_ms(int ms) { if (ms > 0) Sleep((DWORD)ms); }
 #else
     #include <unistd.h>
-    static void sleep_ms(int ms) { if (ms > 0) usleep((useconds_t)(ms * 1000)); }
+    #include <sys/time.h>
 #endif
+
+static long long emu_now_ms(void) {
+#ifdef _WIN32
+    return (long long)GetTickCount();
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000LL;
+#endif
+}
+
+/* =========================================================
+   Asynchronous Packet Delay Queue
+   Simulates true propagation delay for pipelined traffic
+   ========================================================= */
+#define QUEUE_MAX 1024
+
+typedef struct {
+    Packet             pkt;
+    struct sockaddr_in dest;
+    long long          send_at_ms;
+    int                is_ack;
+    int                is_fin;
+} DelayedPkt;
+
+static DelayedPkt pkt_queue[QUEUE_MAX];
+static int q_head  = 0;
+static int q_tail  = 0;
+static int q_count = 0;
+
+static void q_push(const Packet *p, const struct sockaddr_in *dest,
+                   long long send_at, int is_ack, int is_fin) {
+    if (q_count >= QUEUE_MAX) return; /* Drop if queue full */
+    pkt_queue[q_tail].pkt        = *p;
+    pkt_queue[q_tail].dest       = *dest;
+    pkt_queue[q_tail].send_at_ms = send_at;
+    pkt_queue[q_tail].is_ack     = is_ack;
+    pkt_queue[q_tail].is_fin     = is_fin;
+    q_tail = (q_tail + 1) % QUEUE_MAX;
+    q_count++;
+}
 
 int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -131,6 +171,9 @@ int main(int argc, char *argv[]) {
     Packet pkt;
     struct sockaddr_in incoming_addr;
 
+    long long last_data_send_at = 0;
+    long long last_ack_send_at  = 0;
+
     /* ---- Metrics ---- */
     unsigned long total_data_received  = 0;
     unsigned long total_data_forwarded = 0;
@@ -144,6 +187,70 @@ int main(int argc, char *argv[]) {
     printf("[EMULATOR] Proxy active. Waiting for traffic...\n\n");
 
     while (1) {
+        /* 1. Flush any queued packets whose scheduled departure time has arrived */
+        while (q_count > 0 && emu_now_ms() >= pkt_queue[q_head].send_at_ms) {
+            DelayedPkt *dp = &pkt_queue[q_head];
+            if (dp->is_ack) {
+                total_ack_forwarded++;
+                printf("[EMULATOR -> SENDER]   FWD ACK: Type=%d, Ack=%u\n",
+                       dp->pkt.type, dp->pkt.ack_num);
+                send_packet(emu_sock, &dp->pkt, &dp->dest);
+            } else {
+                total_data_forwarded++;
+                if (dp->is_fin) {
+                    printf("[EMULATOR -> RECEIVER] FWD FIN: Seq=%u\n", dp->pkt.seq_num);
+                    send_packet(emu_sock, &dp->pkt, &dp->dest);
+
+                    printf("\n--- EMULATOR SESSION STATS ---\n");
+                    printf("DATA  Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu"
+                           "  (%.1f%% loss, %.1f%% corrupt)\n",
+                           total_data_received, total_data_forwarded,
+                           total_data_dropped, total_data_corrupted,
+                           total_data_received > 0
+                               ? 100.0 * total_data_dropped / total_data_received
+                               : 0.0,
+                           total_data_received > 0
+                               ? 100.0 * total_data_corrupted / total_data_received
+                               : 0.0);
+                    printf("ACK   Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu\n",
+                           total_ack_received, total_ack_forwarded,
+                           total_ack_dropped, total_ack_corrupted);
+                    printf("Delay setting : %d ms", delay_ms);
+                    if (delay_jitter > 0) printf(" ±%d ms jitter", delay_jitter);
+                    printf("\n------------------------------\n\n");
+                } else {
+                    printf("[EMULATOR -> RECEIVER] FWD DATA: Type=%d, Seq=%u, Len=%u\n",
+                           dp->pkt.type, dp->pkt.seq_num, dp->pkt.length);
+                    send_packet(emu_sock, &dp->pkt, &dp->dest);
+                }
+            }
+            q_head = (q_head + 1) % QUEUE_MAX;
+            q_count--;
+        }
+
+        /* 2. Wait for incoming packet or until next queued packet is ready to send */
+        struct timeval tv;
+        struct timeval *tvp = &tv;
+        if (q_count > 0) {
+            long long wait_ms = pkt_queue[q_head].send_at_ms - emu_now_ms();
+            if (wait_ms < 0) wait_ms = 0;
+            tv.tv_sec  = (long)(wait_ms / 1000);
+            tv.tv_usec = (long)((wait_ms % 1000) * 1000);
+        } else {
+            /* No packets in flight; poll socket up to 50ms */
+            tv.tv_sec  = 0;
+            tv.tv_usec = 50000;
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(emu_sock, &rfds);
+        int sel = select((int)(emu_sock + 1), &rfds, NULL, NULL, tvp);
+        if (sel <= 0) {
+            /* Timeout or no packet ready; re-check queue in next iteration */
+            continue;
+        }
+
         int bytes = recv_packet(emu_sock, &pkt, &incoming_addr);
         if (bytes <= 0) continue;
 
@@ -190,21 +297,27 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            /* Apply delay before forwarding ACK */
-            if (delay_ms > 0 || delay_jitter > 0) {
-                int actual = delay_ms;
-                if (delay_jitter > 0) {
-                    int var = (rand() % (2 * delay_jitter + 1)) - delay_jitter;
-                    actual += var;
-                    if (actual < 0) actual = 0;
-                }
-                if (actual > 0) sleep_ms(actual);
+            /* Calculate departure time */
+            int actual = delay_ms;
+            if (delay_jitter > 0) {
+                int var = (rand() % (2 * delay_jitter + 1)) - delay_jitter;
+                actual += var;
+                if (actual < 0) actual = 0;
             }
 
-            total_ack_forwarded++;
-            printf("[EMULATOR -> SENDER]   FWD ACK: Type=%d, Ack=%u\n",
-                   pkt.type, pkt.ack_num);
-            send_packet(emu_sock, &pkt, &sender_addr);
+            long long now = emu_now_ms();
+            long long send_at = now + actual;
+            if (send_at < last_ack_send_at) send_at = last_ack_send_at;
+            last_ack_send_at = send_at;
+
+            if (send_at <= now) {
+                total_ack_forwarded++;
+                printf("[EMULATOR -> SENDER]   FWD ACK: Type=%d, Ack=%u\n",
+                       pkt.type, pkt.ack_num);
+                send_packet(emu_sock, &pkt, &sender_addr);
+            } else {
+                q_push(&pkt, &sender_addr, send_at, 1, 0);
+            }
 
         } else {
             /* ---- Traffic from Sender -> forward DATA to Receiver ---- */
@@ -212,76 +325,82 @@ int main(int argc, char *argv[]) {
             sender_known = 1;
             total_data_received++;
 
-            /* FIN always passes through uncorrupted so transfers terminate cleanly */
-            if (pkt.type == PACKET_FIN) {
-                printf("[EMULATOR -> RECEIVER] FWD FIN: Seq=%u\n", pkt.seq_num);
-                send_packet(emu_sock, &pkt, &receiver_addr);
+            int is_fin = (pkt.type == PACKET_FIN);
 
-                printf("\n--- EMULATOR SESSION STATS ---\n");
-                printf("DATA  Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu"
-                       "  (%.1f%% loss, %.1f%% corrupt)\n",
-                       total_data_received, total_data_forwarded,
-                       total_data_dropped, total_data_corrupted,
-                       total_data_received > 0
-                           ? 100.0 * total_data_dropped / total_data_received
-                           : 0.0,
-                       total_data_received > 0
-                           ? 100.0 * total_data_corrupted / total_data_received
-                           : 0.0);
-                printf("ACK   Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu\n",
-                       total_ack_received, total_ack_forwarded,
-                       total_ack_dropped, total_ack_corrupted);
-                printf("Delay setting : %d ms", delay_ms);
-                if (delay_jitter > 0) printf(" ±%d ms jitter", delay_jitter);
-                printf("\n------------------------------\n\n");
-                continue;
-            }
+            if (!is_fin) {
+                /* DATA drop */
+                if (loss_rate > 0.0) {
+                    double r = (double)rand() / (double)RAND_MAX;
+                    if (r < loss_rate) {
+                        total_data_dropped++;
+                        printf("[EMULATOR DROP] >>> DROPPED DATA: Seq=%u Len=%u "
+                               "(dropped %lu / %.1f%%)\n",
+                               pkt.seq_num, pkt.length, total_data_dropped,
+                               100.0 * total_data_dropped / total_data_received);
+                        continue;
+                    }
+                }
 
-            /* DATA drop */
-            if (loss_rate > 0.0) {
-                double r = (double)rand() / (double)RAND_MAX;
-                if (r < loss_rate) {
-                    total_data_dropped++;
-                    printf("[EMULATOR DROP] >>> DROPPED DATA: Seq=%u Len=%u "
-                           "(dropped %lu / %.1f%%)\n",
-                           pkt.seq_num, pkt.length, total_data_dropped,
-                           100.0 * total_data_dropped / total_data_received);
-                    continue;
+                /* DATA bit-corruption: flip 1 random byte in payload */
+                if (corrupt_rate > 0.0 && pkt.length > 0) {
+                    double r = (double)rand() / (double)RAND_MAX;
+                    if (r < corrupt_rate) {
+                        total_data_corrupted++;
+                        int byte_idx = rand() % pkt.length;
+                        pkt.payload[byte_idx] ^= 0xFF;  /* Invert all 8 bits in payload byte */
+                        printf("[EMULATOR CORRUPT] >>> CORRUPTED DATA: Seq=%u Len=%u "
+                               "(flipped payload byte %d, total corrupted: %lu)\n",
+                               pkt.seq_num, pkt.length, byte_idx, total_data_corrupted);
+                    }
                 }
             }
 
-            /* DATA bit-corruption: flip 1 random byte in payload */
-            if (corrupt_rate > 0.0 && pkt.length > 0) {
-                double r = (double)rand() / (double)RAND_MAX;
-                if (r < corrupt_rate) {
-                    total_data_corrupted++;
-                    int byte_idx = rand() % pkt.length;
-                    pkt.payload[byte_idx] ^= 0xFF;  /* Invert all 8 bits in payload byte */
-                    printf("[EMULATOR CORRUPT] >>> CORRUPTED DATA: Seq=%u Len=%u "
-                           "(flipped payload byte %d, total corrupted: %lu)\n",
-                           pkt.seq_num, pkt.length, byte_idx, total_data_corrupted);
-                }
+            /* Calculate departure time */
+            int actual = delay_ms;
+            if (delay_jitter > 0) {
+                int var = (rand() % (2 * delay_jitter + 1)) - delay_jitter;
+                actual += var;
+                if (actual < 0) actual = 0;
             }
 
-            /* Apply delay before forwarding DATA */
-            if (delay_ms > 0 || delay_jitter > 0) {
-                int actual = delay_ms;
-                if (delay_jitter > 0) {
-                    int var = (rand() % (2 * delay_jitter + 1)) - delay_jitter;
-                    actual += var;
-                    if (actual < 0) actual = 0;
-                }
-                if (actual > 0) {
-                    printf("[EMULATOR DELAY] Delaying Seq=%u by %d ms\n",
-                           pkt.seq_num, actual);
-                    sleep_ms(actual);
-                }
-            }
+            long long now = emu_now_ms();
+            long long send_at = now + actual;
+            if (send_at < last_data_send_at) send_at = last_data_send_at;
+            last_data_send_at = send_at;
 
-            total_data_forwarded++;
-            printf("[EMULATOR -> RECEIVER] FWD DATA: Type=%d, Seq=%u, Len=%u\n",
-                   pkt.type, pkt.seq_num, pkt.length);
-            send_packet(emu_sock, &pkt, &receiver_addr);
+            if (send_at <= now) {
+                total_data_forwarded++;
+                if (is_fin) {
+                    printf("[EMULATOR -> RECEIVER] FWD FIN: Seq=%u\n", pkt.seq_num);
+                    send_packet(emu_sock, &pkt, &receiver_addr);
+
+                    printf("\n--- EMULATOR SESSION STATS ---\n");
+                    printf("DATA  Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu"
+                           "  (%.1f%% loss, %.1f%% corrupt)\n",
+                           total_data_received, total_data_forwarded,
+                           total_data_dropped, total_data_corrupted,
+                           total_data_received > 0
+                               ? 100.0 * total_data_dropped / total_data_received
+                               : 0.0,
+                           total_data_received > 0
+                               ? 100.0 * total_data_corrupted / total_data_received
+                               : 0.0);
+                    printf("ACK   Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu\n",
+                           total_ack_received, total_ack_forwarded,
+                           total_ack_dropped, total_ack_corrupted);
+                    printf("Delay setting : %d ms", delay_ms);
+                    if (delay_jitter > 0) printf(" ±%d ms jitter", delay_jitter);
+                    printf("\n------------------------------\n\n");
+                } else {
+                    printf("[EMULATOR -> RECEIVER] FWD DATA: Type=%d, Seq=%u, Len=%u\n",
+                           pkt.type, pkt.seq_num, pkt.length);
+                    send_packet(emu_sock, &pkt, &receiver_addr);
+                }
+            } else {
+                printf("[EMULATOR DELAY] Queued Seq=%u for departure in %d ms\n",
+                       pkt.seq_num, actual);
+                q_push(&pkt, &receiver_addr, send_at, 0, is_fin);
+            }
         }
     }
 

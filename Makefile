@@ -21,7 +21,7 @@ OBJS_ALL    = $(OBJS_COMMON) $(SRC_DIR)/stop_and_wait.o $(SRC_DIR)/go_back_n.o $
 BINARIES = emulator.exe sender.exe receiver.exe
 TESTS    = test_packet.exe test_loopback.exe test_emulator.exe test_loss.exe \
            test_file_io.exe test_delay.exe test_buffer.exe test_sw.exe test_gbn.exe \
-           test_corrupt.exe test_sr.exe test_stress.exe
+           test_corrupt.exe test_sr.exe test_stress.exe test_delay_bench.exe
 TARGETS  = $(BINARIES) $(TESTS)
 
 all: $(TARGETS)
@@ -76,6 +76,9 @@ test_sr.exe: $(TEST_DIR)/test_selective_repeat.c $(OBJS_SR)
 test_stress.exe: $(TEST_DIR)/test_stress.c $(OBJS_ALL)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+test_delay_bench.exe: $(TEST_DIR)/test_delay_benchmark.c $(OBJS_ALL)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 # ── Run ALL Tests ─────────────────────────────────────────────
 test: all
 	@echo Running test_packet...
@@ -102,6 +105,8 @@ test: all
 	@./test_sr.exe
 	@echo Running test_stress...
 	@./test_stress.exe
+	@echo Running test_delay_bench...
+	@./test_delay_bench.exe
 
 # ── Automated Benchmark & Plotting (Day 6) ───────────────────
 benchmark: sender.exe receiver.exe emulator.exe
