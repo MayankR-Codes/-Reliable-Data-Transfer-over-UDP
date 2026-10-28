@@ -199,8 +199,158 @@ int main(void) {
            wb.base, wb.next_seq_num, wbuf_in_flight(&wb));
     printf(">>> TEST 10 PASSED: Ring buffer handles large sequence numbers!\n\n");
 
+    /* ================================================================== */
+    /*  Dimple's Day 4 RecvBuffer Tests (Selective Repeat Out-of-Order)   */
+    /* ================================================================== */
     printf("====================================================\n");
-    printf(">>> ALL DIMPLE DAY 3 TESTS PASSED 100%%! <<<\n");
+    printf("  Running Dimple's Day 4 RecvBuffer Tests           \n");
+    printf("====================================================\n\n");
+
+    RecvBuffer rb;
+
+    /* ------------------------------------------------------------------ */
+    /* TEST 11: RecvBuffer init and parameter validation */
+    /* ------------------------------------------------------------------ */
+    printf("[TEST 11] Initialize RecvBuffer and validate window boundaries...\n");
+    assert(rbuf_init(&rb, 4) == 0);
+    assert(rb.window_size == 4);
+    assert(rb.rcv_base == 0);
+    assert(rbuf_init(NULL, 4) == -1);
+    assert(rbuf_init(&rb, 0) == -1);
+    assert(rbuf_init(&rb, MAX_WINDOW_SIZE + 1) == -1);
+
+    /* Within window: [0, 3] */
+    assert(rbuf_is_in_window(&rb, 0) == 1);
+    assert(rbuf_is_in_window(&rb, 1) == 1);
+    assert(rbuf_is_in_window(&rb, 2) == 1);
+    assert(rbuf_is_in_window(&rb, 3) == 1);
+    assert(rbuf_is_in_window(&rb, 4) == 0);
+    assert(rbuf_is_buffered(&rb, 0) == 0);
+    printf(">>> TEST 11 PASSED: RecvBuffer initialized & window bounds verified!\n\n");
+
+    /* ------------------------------------------------------------------ */
+    /* TEST 12: RecvBuffer out-of-order storage & bounds checking */
+    /* ------------------------------------------------------------------ */
+    printf("[TEST 12] Storing out-of-order packets (gap at seq=0)...\n");
+    Packet p1, p2, p_out;
+    init_packet(&p1, PACKET_DATA, 1, 0, "Chunk-1", 7);
+    init_packet(&p2, PACKET_DATA, 2, 0, "Chunk-2", 7);
+    init_packet(&p_out, PACKET_DATA, 5, 0, "Chunk-5", 7);
+
+    assert(rbuf_put(&rb, &p2) == 0);
+    assert(rbuf_put(&rb, &p1) == 0);
+    assert(rbuf_put(&rb, &p_out) == -1); /* Seq 5 is outside window [0..3] */
+
+    assert(rbuf_is_buffered(&rb, 0) == 0);
+    assert(rbuf_is_buffered(&rb, 1) == 1);
+    assert(rbuf_is_buffered(&rb, 2) == 1);
+    assert(rbuf_is_buffered(&rb, 3) == 0);
+    printf("  Buffered: seq=1 (yes), seq=2 (yes), seq=0 (no - gap)\n");
+    printf(">>> TEST 12 PASSED: Out-of-order storage and rejection work correctly!\n\n");
+
+    /* ------------------------------------------------------------------ */
+    /* TEST 13: RecvBuffer contiguous flush on gap fill */
+    /* ------------------------------------------------------------------ */
+    printf("[TEST 13] Flushing with gap vs flushing after gap is filled...\n");
+    FILE *tfp = fopen("test_data/rbuf_test.tmp", "wb");
+    assert(tfp != NULL);
+
+    unsigned long bytes_written = 0;
+    unsigned long chunks_written = 0;
+
+    /* Base is 0, slot 0 is empty -> flush must return 0 */
+    int flushed = rbuf_flush_contiguous(&rb, tfp, &bytes_written, &chunks_written);
+    assert(flushed == 0);
+    assert(rb.rcv_base == 0);
+    printf("  Gap at seq=0: flushed %d chunks (expected 0)\n", flushed);
+
+    /* Fill gap by inserting seq=0 */
+    Packet p0;
+    init_packet(&p0, PACKET_DATA, 0, 0, "Chunk-0", 7);
+    assert(rbuf_put(&rb, &p0) == 0);
+    assert(rbuf_is_buffered(&rb, 0) == 1);
+
+    /* Now flush should contiguous-flush 0, 1, 2 and advance rcv_base to 3 */
+    flushed = rbuf_flush_contiguous(&rb, tfp, &bytes_written, &chunks_written);
+    printf("  After inserting seq=0: flushed %d chunks, rcv_base=%u\n", flushed, rb.rcv_base);
+    assert(flushed == 3);
+    assert(rb.rcv_base == 3);
+    assert(chunks_written == 3);
+    assert(bytes_written == 21);
+    assert(rbuf_is_buffered(&rb, 0) == 0); /* Cleared after flush */
+    assert(rbuf_is_buffered(&rb, 1) == 0);
+    assert(rbuf_is_buffered(&rb, 2) == 0);
+    fclose(tfp);
+
+    /* Verify file content */
+    tfp = fopen("test_data/rbuf_test.tmp", "rb");
+    assert(tfp != NULL);
+    char readback[32] = {0};
+    size_t nr = fread(readback, 1, sizeof(readback), tfp);
+    assert(nr == 21);
+    assert(memcmp(readback, "Chunk-0Chunk-1Chunk-2", 21) == 0);
+    fclose(tfp);
+    remove("test_data/rbuf_test.tmp");
+    printf(">>> TEST 13 PASSED: Contiguous flushing flushes exactly in-order sequence!\n\n");
+
+    /* ------------------------------------------------------------------ */
+    /* TEST 14: Duplicate handling and out-of-window packet rejection */
+    /* ------------------------------------------------------------------ */
+    printf("[TEST 14] Duplicate packet and stale packet handling...\n");
+    /* rcv_base is 3, window is 4 -> window is [3..6] */
+    Packet p3;
+    init_packet(&p3, PACKET_DATA, 3, 0, "Chunk-3", 7);
+    assert(rbuf_put(&rb, &p3) == 0);
+    /* Duplicate write to slot 3 should succeed */
+    assert(rbuf_put(&rb, &p3) == 0);
+
+    /* Stale packet seq=1 (< rcv_base=3) must be rejected */
+    assert(rbuf_is_in_window(&rb, 1) == 0);
+    assert(rbuf_put(&rb, &p1) == -1);
+
+    /* Advance rcv_base past 3 */
+    tfp = fopen("test_data/rbuf_test.tmp", "wb");
+    assert(tfp != NULL);
+    flushed = rbuf_flush_contiguous(&rb, tfp, NULL, NULL);
+    assert(flushed == 1);
+    assert(rb.rcv_base == 4);
+    fclose(tfp);
+    remove("test_data/rbuf_test.tmp");
+    printf(">>> TEST 14 PASSED: Duplicate & stale packet handling verified!\n\n");
+
+    /* ------------------------------------------------------------------ */
+    /* TEST 15: RecvBuffer reset & large sequence rollover */
+    /* ------------------------------------------------------------------ */
+    printf("[TEST 15] RecvBuffer reset and sequence rollover handling...\n");
+    rbuf_reset(&rb);
+    assert(rb.rcv_base == 0);
+    assert(rb.window_size == 0);
+
+    assert(rbuf_init(&rb, 4) == 0);
+    rb.rcv_base = 0xFFFFFFFEu; /* Near 32-bit wrap */
+    assert(rbuf_is_in_window(&rb, 0xFFFFFFFEu) == 1);
+    assert(rbuf_is_in_window(&rb, 0xFFFFFFFFu) == 1);
+    assert(rbuf_is_in_window(&rb, 0x00000000u) == 1);
+    assert(rbuf_is_in_window(&rb, 0x00000001u) == 1);
+    assert(rbuf_is_in_window(&rb, 0x00000002u) == 0);
+
+    Packet wrap0, wrap1;
+    init_packet(&wrap0, PACKET_DATA, 0xFFFFFFFEu, 0, "WrapA", 5);
+    init_packet(&wrap1, PACKET_DATA, 0xFFFFFFFFu, 0, "WrapB", 5);
+    assert(rbuf_put(&rb, &wrap0) == 0);
+    assert(rbuf_put(&rb, &wrap1) == 0);
+
+    tfp = fopen("test_data/rbuf_test.tmp", "wb");
+    assert(tfp != NULL);
+    flushed = rbuf_flush_contiguous(&rb, tfp, NULL, NULL);
+    assert(flushed == 2);
+    assert(rb.rcv_base == 0x00000000u); /* Successfully rolled over! */
+    fclose(tfp);
+    remove("test_data/rbuf_test.tmp");
+    printf(">>> TEST 15 PASSED: Rollover and reset verified!\n\n");
+
+    printf("====================================================\n");
+    printf(">>> ALL DIMPLE DAY 3 & DAY 4 TESTS PASSED 100%%! <<<\n");
     printf("====================================================\n");
     return 0;
 }
