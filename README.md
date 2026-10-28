@@ -1,135 +1,181 @@
 # Reliable Data Transfer over UDP
 
-A from-scratch reliable file-transfer system built on top of UDP. The project demonstrates how transport protocols can provide correct, ordered, and verifiable delivery even when the underlying network loses, duplicates, reorders, delays, or corrupts packets.
+A complete, production-grade reliable file transfer system built from scratch on top of UDP sockets in C. The project implements application-layer transport reliability with **Stop-and-Wait (SW)**, **Go-Back-N (GBN)**, and **Selective Repeat (SR)** ARQ protocols, alongside a configurable **Network Channel Emulator** that simulates packet loss, latency delay, jitter, and bit corruption.
 
-## Overview
+---
 
-UDP is fast and lightweight, but it does not provide delivery guarantees. This project adds those guarantees at the application layer through three ARQ (Automatic Repeat reQuest) protocols:
-
-- **Stop-and-Wait ARQ** - sends one packet at a time and waits for its acknowledgement.
-- **Go-Back-N ARQ** - allows a window of packets in flight and retransmits from the first missing packet after a loss.
-- **Selective Repeat ARQ** - acknowledges and retransmits only the packets that are missing or damaged.
-
-A configurable channel emulator sits between the sender and receiver so the protocols can be tested under controlled network impairments.
-
-## Core Features
-
-- Reliable file transfer over POSIX UDP sockets
-- Ordered delivery with sequence numbers and acknowledgements
-- Packet checksums for corruption detection
-- Retransmission timers and timeout handling
-- Adaptive retransmission timeout (RTO)
-- Karn's algorithm to avoid using ambiguous RTT samples
-- Configurable packet loss, duplication, reordering, corruption, and delay
-- File integrity verification using hash comparison
-- Experiment data collection and comparative plots with Python and Matplotlib
-
-## System Design
+## 1. System Architecture
 
 ```text
-						 +-------------------+
-						 |   Channel Emulator |
-						 | loss | delay | ... |
-						 +---------+---------+
-								   |
-+----------------+       UDP      |      +----------------+
-|     Sender     +----------------------->+    Receiver    |
-| ARQ + timers   |                         | ARQ + buffering|
-+----------------+<-----------------------+----------------+
-				 acknowledgements / control
+               +-------------------------------------------+
+               |          Channel Emulator (Proxy)         |
+               |  --loss <%>  --delay <ms>  --corrupt <%>  |
+               +---------------------+---------------------+
+                                     ^
+                         Forward     |      Forward
+                         DATA Pkts   |      ACK Pkts
+                                     v
++------------------------+      UDP Datagrams      +------------------------+
+|      UDP Sender        +------------------------>+      UDP Receiver      |
+|  ./sender              |                         |  ./receiver            |
+|  - File chunking       |<------------------------+  - Packet validation   |
+|  - ARQ retransmissions |     Acknowledgements    |  - Out-of-order buffer |
+|  - Fixed 200ms timers  |      (Cum / Select)     |  - File reassembly     |
+|  - SHA-256 hash verify |                         |  - SHA-256 hash verify |
++------------------------+                         +------------------------+
 ```
 
-Each data packet contains the information needed for validation and recovery, including a packet type, sequence number, payload length, checksum, and payload. Receivers discard corrupted packets, buffer valid out-of-order packets where the protocol permits it, and acknowledge received data. The sender uses acknowledgements and timer events to decide when retransmission is required.
+---
 
-## Protocols
+## 2. Team Members & Module Ownership
 
-| Protocol | Sender window | Recovery behavior | Expected trade-off |
-| --- | ---: | --- | --- |
-| Stop-and-Wait | 1 | Retransmit the current packet | Simple, but low goodput on delayed links |
-| Go-Back-N | Configurable | Retransmit the missing packet and all later unacknowledged packets | Better link utilization, but loss causes redundant retransmissions |
-| Selective Repeat | Configurable | Retransmit only missing or corrupted packets | More buffering and logic, but efficient under loss |
+| Member | Primary Ownership | Core Modules & Deliverables |
+| :--- | :--- | :--- |
+| **Mayank Rana** | **Channel Emulator, CLI Binaries, Benchmarks & Visualizations** | `src/emulator.c`, `src/sender.c`, `src/receiver.c`, `Makefile`, `scripts/benchmark.py`, `scripts/plot_results.py`, `README.md` |
+| **Dimple Mohapatra** | **Foundation, Packet Structure, File I/O & Buffers** | `include/packet.h`, `src/packet.c`, `include/socket_utils.h`, `src/socket_utils.c`, `include/file_io.h`, `src/file_io.c`, `include/buffer.h` |
+| **Manisha Behera** | **Stop-and-Wait & Go-Back-N Protocols** | `include/protocols.h`, `src/stop_and_wait.c`, `src/go_back_n.c`, sliding window cumulative ACKs |
+| **Raushan Kumar** | **Selective Repeat Protocol & Buffering** | `src/selective_repeat.c`, receiver circular buffer, per-packet timers & selective ACKs |
 
-All protocols will use the same packet size, file size, checksum mechanism, and test environment so their performance can be compared fairly.
+---
 
-## Channel Emulator
+## 3. Supported ARQ Protocols
 
-The emulator will expose configurable impairment parameters, including:
+1. **Stop-and-Wait (SW):**
+   - 1-bit alternating sequence number ($0 \leftrightarrow 1$).
+   - Sender transmits 1 chunk and blocks waiting for ACK with a fixed 200 ms timeout.
+   - Ideal for low-latency, zero-loss links; throughput degrades on delayed or lossy channels.
 
-- Packet-loss probability
-- Packet-duplication probability
-- Packet-reordering probability
-- Packet-corruption probability
-- Network delay and delay variation
+2. **Go-Back-N (GBN):**
+   - Sliding window of size $N$ (e.g., $N=8$).
+   - Pipelined packet transmission using cumulative ACKs.
+   - Single base timer (200 ms). Upon timeout, retransmits the **entire unacknowledged window** $[base \dots next\_seq - 1]$.
+   - Receiver accepts only in-order packets; discards out-of-order packets and re-ACKs the last in-order sequence.
 
-Impairments will first be tested independently and then in combination. This makes it easier to isolate protocol bugs and understand how each condition affects performance.
+3. **Selective Repeat (SR):**
+   - Sliding window of size $N$ with sequence number space $\ge 2N$.
+   - Independent per-packet 200 ms timer for every packet in flight.
+   - Receiver buffers out-of-order packets and returns individual selective ACKs.
+   - Retransmits **only** the specific packet that timed out, preventing redundant window retransmissions under loss.
 
-## Performance Claim
+---
 
-> **Claim:** As packet loss increases, Selective Repeat will achieve better goodput than Go-Back-N and Stop-and-Wait.
+## 4. Channel Emulator Features
 
-The experiment will vary:
+The emulator (`emulator.exe`) acts as a UDP network proxy between sender and receiver:
+- `--loss <percent>`: Probabilistic DATA packet drop rate (e.g., `--loss 15` for 15%).
+- `--loss-ack <percent>`: Independent ACK drop rate.
+- `--delay <ms>`: Artificial network latency added before forwarding packets.
+- `--jitter <ms>`: Random delay variation ($\pm jitter$ ms).
+- `--corrupt <percent>`: Bit corruption that randomly inverts bits in a payload byte, triggering CRC32 checksum mismatch at the receiver.
+- `--seed <number>`: Deterministic random seed for reproducible benchmark experiments.
 
-- Packet-loss rate
-- Sender/receiver window size
-- Packet-reordering probability
+---
 
-The following variables will remain constant during comparable runs:
+## 5. Build & Compilation Instructions
 
-- Packet size
-- Input file size
-- Hardware and runtime environment
+### Prerequisites
+- GCC Compiler (MinGW on Windows or GCC on Linux)
+- Python 3 with `matplotlib` (for benchmarking and plotting)
 
-We will measure:
+### Compilation
+Build all binaries and test suites using `mingw32-make` (or `make`):
+```bash
+# Build all executables
+mingw32-make all
 
-- **Goodput** - successfully delivered application data per unit of time
-- **Retransmissions** - total packets resent after timeout or negative evidence
-- **Transfer time** - elapsed time from the first transmitted packet to verified completion
+# Run all automated test suites
+mingw32-make test
+```
 
-Results will be exported for analysis and presented with comparative Python/Matplotlib graphs. Every completed transfer will also be checked by comparing the receiver's file hash with the source file hash.
+This compiles:
+- `sender.exe` — Unified file sender CLI
+- `receiver.exe` — Unified file receiver CLI
+- `emulator.exe` — Network impairment proxy
 
-## Technology Stack
+---
 
-- **C** - protocol implementation, packet handling, timers, buffering, and socket control
-- **POSIX UDP sockets** - network communication
-- **Standard C libraries** - file I/O, memory management, timing, and utilities
-- **Hashing library** - end-to-end file integrity verification
-- **Python and Matplotlib** - experiment automation, analysis, and visualization
+## 6. Command-Line Reference
 
-C was selected to provide low-level control over datagrams, packet layouts, retransmission state, timers, and receive buffers while keeping the protocol implementation close to the underlying network behavior.
+### Receiver
+```bash
+./receiver.exe --port <port> --output <filepath> --protocol <sw|gbn|sr> [--window <N>]
+```
+- Example:
+  ```bash
+  ./receiver.exe --port 9001 --output received.bin --protocol sr --window 8
+  ```
 
-## Development Roadmap
+### Channel Emulator
+```bash
+./emulator.exe --listen <listen_port> --recv-port <recv_port> [--loss <%>] [--delay <ms>] [--corrupt <%>]
+```
+- Example (10% Loss, 20ms Delay, 5% Corruption):
+  ```bash
+  ./emulator.exe --listen 8000 --recv-port 9001 --loss 10 --delay 20 --corrupt 5
+  ```
 
-1. Define the packet format and checksum validation rules.
-2. Implement basic UDP sender and receiver communication.
-3. Add Stop-and-Wait with fixed retransmission timeouts.
-4. Add Go-Back-N with cumulative acknowledgements and a sliding window.
-5. Add Selective Repeat with receiver buffering and per-packet recovery.
-6. Add the channel emulator and test each impairment independently.
-7. Add adaptive RTO estimation and Karn's algorithm.
-8. Add hash verification, experiment logging, and plotting scripts.
-9. Run controlled comparisons and document the results.
+### Sender
+```bash
+./sender.exe --file <filepath> --ip <dest_ip> --port <port> --protocol <sw|gbn|sr> [--window <N>]
+```
+- Example:
+  ```bash
+  ./sender.exe --file sample.bin --ip 127.0.0.1 --port 8000 --protocol sr --window 8
+  ```
 
-Fixed timeouts will be used first to reduce debugging complexity. Adaptive RTO will be introduced only after the basic retransmission behavior is stable.
+---
 
-## Team Responsibilities
+## 7. End-to-End Demo Guide
 
-| Contributor | Responsibility |
-| --- | --- |
-| Dimple Mohapatra | UDP communication, packet structure, and checksum |
-| Manisha Behera | Stop-and-Wait and Go-Back-N implementations |
-| Raushan Kumar | Selective Repeat, timers, and adaptive RTO |
-| Mayank Rana | Channel emulator, experiments, and visualization |
-| All members | Integration, testing, documentation, and viva preparation |
+Run the 3-node topology across 3 separate terminal sessions:
 
-## Risk Management
+**Terminal 1 — Receiver:**
+```bash
+./receiver.exe --port 9001 --output test_data/demo_out.bin --protocol gbn --window 8
+```
 
-| Risk | Mitigation |
-| --- | --- |
-| Timer and retransmission bugs | Begin with fixed timeouts, then add adaptive RTO after protocol behavior is verified |
-| Difficulty isolating network impairments | Test loss, duplication, reordering, corruption, and delay separately before combining them |
-| Incorrect or incomplete transfers | Validate checksums per packet and compare complete-file hashes after every test |
-| Unfair performance comparisons | Keep packet size, file size, hardware, and experiment conditions consistent |
+**Terminal 2 — Emulator (15% Loss, 10ms Delay):**
+```bash
+./emulator.exe --listen 8000 --recv-port 9001 --loss 15 --delay 10
+```
 
-## Project Status
+**Terminal 3 — Sender:**
+```bash
+./sender.exe --file test_data/benchmark_input.bin --ip 127.0.0.1 --port 8000 --protocol gbn --window 8
+```
 
-This repository contains the project specification and will be developed incrementally according to the roadmap above.
+Verify SHA-256 hash matching between source and received file:
+```bash
+certutil -hashfile test_data/benchmark_input.bin SHA256
+certutil -hashfile test_data/demo_out.bin SHA256
+```
+
+---
+
+## 8. Automated Benchmarks & Visualizations
+
+Run the automated test matrix across all protocols (SW, GBN, SR) and loss rates ($0\%, 5\%, 10\%, 15\%, 20\%, 25\%$):
+
+```bash
+mingw32-make benchmark
+```
+
+This runs `scripts/benchmark.py` and `scripts/plot_results.py`, generating 3 Matplotlib plots in `results/`:
+- `results/goodput_comparison.png` — Goodput (KB/s) vs. Packet Loss Rate (%)
+- `results/retransmissions_comparison.png` — Retransmissions vs. Packet Loss Rate (%)
+- `results/transfer_time_comparison.png` — Elapsed Transfer Time vs. Packet Loss Rate (%)
+
+### Core Findings & Comparison
+- **0% Loss:** GBN and SR achieve near-identical maximum throughput due to pipelining; Stop-and-Wait is significantly slower due to half-duplex blocking.
+- **Moderate to High Loss (10% – 25%):**
+  - **Selective Repeat** maintains high resilience because only dropped packets are retransmitted.
+  - **Go-Back-N** experiences retransmission multiplication because dropping packet $k$ causes the entire window from $k$ onwards to be discarded and retransmitted.
+  - **Stop-and-Wait** goodput drops steeply as each packet loss incurs a 200 ms timeout idle delay.
+
+---
+
+## 9. Verification & Data Integrity
+
+Every transfer validates 100% data integrity:
+- Packet-level CRC32 checksums detect bit-level corruptions in transit.
+- Native SHA-256 cryptographic hashing verifies complete bit-for-bit file reconstruction after transfer.

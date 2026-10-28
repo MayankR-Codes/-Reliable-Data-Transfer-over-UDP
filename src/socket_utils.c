@@ -25,7 +25,17 @@ SOCKET create_udp_socket(void) {
     SOCKET sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sockfd == INVALID_SOCKET) {
         perror("[ERROR] Failed to create UDP socket");
+        return sockfd;
     }
+#ifdef _WIN32
+    #ifndef SIO_UDP_CONNRESET
+    #  define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+    #endif
+    BOOL bNewBehavior = FALSE;
+    DWORD dwBytesReturned = 0;
+    WSAIoctl(sockfd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior),
+             NULL, 0, &dwBytesReturned, NULL, NULL);
+#endif
     return sockfd;
 }
 
