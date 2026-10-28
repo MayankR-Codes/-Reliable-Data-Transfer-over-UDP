@@ -18,13 +18,15 @@
 int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    int listen_port      = 8000;
-    int receiver_port    = 9001;
-    char receiver_ip[64] = "127.0.0.1";
-    double loss_rate     = 0.0;  /* 0.0 – 1.0, e.g. 0.10 = 10%  */
-    double loss_ack_rate = 0.0;  /* optional independent ACK loss */
-    int    delay_ms      = 0;    /* one-way delay in milliseconds  */
-    int    delay_jitter  = 0;    /* ±jitter added to delay_ms      */
+    int listen_port          = 8000;
+    int receiver_port        = 9001;
+    char receiver_ip[64]     = "127.0.0.1";
+    double loss_rate         = 0.0;  /* 0.0 – 1.0, e.g. 0.10 = 10%  */
+    double loss_ack_rate     = 0.0;  /* optional independent ACK loss */
+    double corrupt_rate      = 0.0;  /* DATA packet payload corruption rate */
+    double corrupt_ack_rate  = 0.0;  /* optional ACK corruption rate */
+    int    delay_ms          = 0;    /* one-way delay in milliseconds  */
+    int    delay_jitter      = 0;    /* ±jitter added to delay_ms      */
     unsigned int random_seed = (unsigned int)time(NULL);
     int seed_provided = 0;
 
@@ -46,6 +48,16 @@ int main(int argc, char *argv[]) {
             loss_ack_rate = (val > 1.0) ? (val / 100.0) : val;
             if (loss_ack_rate < 0.0) loss_ack_rate = 0.0;
             if (loss_ack_rate > 1.0) loss_ack_rate = 1.0;
+        } else if (strcmp(argv[i], "--corrupt") == 0 && i + 1 < argc) {
+            double val = atof(argv[++i]);
+            corrupt_rate = (val > 1.0) ? (val / 100.0) : val;
+            if (corrupt_rate < 0.0) corrupt_rate = 0.0;
+            if (corrupt_rate > 1.0) corrupt_rate = 1.0;
+        } else if (strcmp(argv[i], "--corrupt-ack") == 0 && i + 1 < argc) {
+            double val = atof(argv[++i]);
+            corrupt_ack_rate = (val > 1.0) ? (val / 100.0) : val;
+            if (corrupt_ack_rate < 0.0) corrupt_ack_rate = 0.0;
+            if (corrupt_ack_rate > 1.0) corrupt_ack_rate = 1.0;
         } else if (strcmp(argv[i], "--delay") == 0 && i + 1 < argc) {
             delay_ms = atoi(argv[++i]);
             if (delay_ms < 0) delay_ms = 0;
@@ -63,6 +75,8 @@ int main(int argc, char *argv[]) {
             printf("  --recv-port <port>   Receiver port               (default: 9001)\n");
             printf("  --loss <percent>     DATA drop rate, e.g. 10 or 0.10 for 10%%\n");
             printf("  --loss-ack <percent> ACK drop rate               (default: 0%%)\n");
+            printf("  --corrupt <percent>  DATA corruption rate        (default: 0%%)\n");
+            printf("  --corrupt-ack <pct>  ACK corruption rate         (default: 0%%)\n");
             printf("  --delay <ms>         Artificial one-way delay in ms (default: 0)\n");
             printf("  --jitter <ms>        Random delay variation ±ms  (default: 0)\n");
             printf("  --seed <number>      RNG seed for reproducible experiments\n");
@@ -75,13 +89,17 @@ int main(int argc, char *argv[]) {
 
     /* ---- Banner ---- */
     printf("====================================================\n");
-    printf("   Channel Emulator (Proxy) — Day 3: Loss + Delay   \n");
+    printf("   Channel Emulator (Proxy) — Day 4: Loss/Delay/Corrupt\n");
     printf("====================================================\n");
     printf("Listening on Port        : %d\n", listen_port);
     printf("Forwarding target (Recv) : %s:%d\n", receiver_ip, receiver_port);
     printf("DATA Packet Loss Rate    : %.1f%%\n", loss_rate * 100.0);
     if (loss_ack_rate > 0.0)
         printf("ACK Packet Loss Rate     : %.1f%%\n", loss_ack_rate * 100.0);
+    if (corrupt_rate > 0.0)
+        printf("DATA Packet Corrupt Rate : %.1f%%\n", corrupt_rate * 100.0);
+    if (corrupt_ack_rate > 0.0)
+        printf("ACK Packet Corrupt Rate  : %.1f%%\n", corrupt_ack_rate * 100.0);
     printf("Network Delay            : %d ms", delay_ms);
     if (delay_jitter > 0) printf(" ±%d ms jitter", delay_jitter);
     printf("\n");
@@ -117,9 +135,11 @@ int main(int argc, char *argv[]) {
     unsigned long total_data_received  = 0;
     unsigned long total_data_forwarded = 0;
     unsigned long total_data_dropped   = 0;
+    unsigned long total_data_corrupted = 0;
     unsigned long total_ack_received   = 0;
     unsigned long total_ack_forwarded  = 0;
     unsigned long total_ack_dropped    = 0;
+    unsigned long total_ack_corrupted  = 0;
 
     printf("[EMULATOR] Proxy active. Waiting for traffic...\n\n");
 
@@ -127,14 +147,14 @@ int main(int argc, char *argv[]) {
         int bytes = recv_packet(emu_sock, &pkt, &incoming_addr);
         if (bytes <= 0) continue;
 
-        /* Verify checksum */
+        /* Verify checksum on incoming packet */
         if (!verify_packet_checksum(&pkt)) {
             printf("[EMULATOR WARNING] Corrupted packet received! "
                    "Type=%d Checksum=0x%08X\n", pkt.type, pkt.checksum);
         }
 
         /* ---- Traffic from Receiver -> forward ACK to Sender ---- */
-        if (incoming_addr.sin_port      == receiver_addr.sin_port &&
+        if (incoming_addr.sin_port        == receiver_addr.sin_port &&
             incoming_addr.sin_addr.s_addr == receiver_addr.sin_addr.s_addr) {
 
             total_ack_received++;
@@ -157,11 +177,23 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            /* ACK corruption */
+            if (corrupt_ack_rate > 0.0) {
+                double r = (double)rand() / (double)RAND_MAX;
+                if (r < corrupt_ack_rate) {
+                    total_ack_corrupted++;
+                    /* Invert checksum so recipient rejects ACK */
+                    pkt.checksum ^= 0xFFFFFFFF;
+                    printf("[EMULATOR CORRUPT] >>> CORRUPTED ACK: Ack=%u "
+                           "(total corrupted: %lu)\n",
+                           pkt.ack_num, total_ack_corrupted);
+                }
+            }
+
             /* Apply delay before forwarding ACK */
             if (delay_ms > 0 || delay_jitter > 0) {
                 int actual = delay_ms;
                 if (delay_jitter > 0) {
-                    /* uniform ±jitter */
                     int var = (rand() % (2 * delay_jitter + 1)) - delay_jitter;
                     actual += var;
                     if (actual < 0) actual = 0;
@@ -180,21 +212,25 @@ int main(int argc, char *argv[]) {
             sender_known = 1;
             total_data_received++;
 
-            /* FIN always passes through so transfers can terminate cleanly */
+            /* FIN always passes through uncorrupted so transfers terminate cleanly */
             if (pkt.type == PACKET_FIN) {
                 printf("[EMULATOR -> RECEIVER] FWD FIN: Seq=%u\n", pkt.seq_num);
                 send_packet(emu_sock, &pkt, &receiver_addr);
 
                 printf("\n--- EMULATOR SESSION STATS ---\n");
-                printf("DATA  Received: %lu  Forwarded: %lu  Dropped: %lu"
-                       "  (%.1f%% actual loss)\n",
+                printf("DATA  Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu"
+                       "  (%.1f%% loss, %.1f%% corrupt)\n",
                        total_data_received, total_data_forwarded,
-                       total_data_dropped,
+                       total_data_dropped, total_data_corrupted,
                        total_data_received > 0
                            ? 100.0 * total_data_dropped / total_data_received
+                           : 0.0,
+                       total_data_received > 0
+                           ? 100.0 * total_data_corrupted / total_data_received
                            : 0.0);
-                printf("ACK   Received: %lu  Forwarded: %lu  Dropped: %lu\n",
-                       total_ack_received, total_ack_forwarded, total_ack_dropped);
+                printf("ACK   Received: %lu  Forwarded: %lu  Dropped: %lu  Corrupted: %lu\n",
+                       total_ack_received, total_ack_forwarded,
+                       total_ack_dropped, total_ack_corrupted);
                 printf("Delay setting : %d ms", delay_ms);
                 if (delay_jitter > 0) printf(" ±%d ms jitter", delay_jitter);
                 printf("\n------------------------------\n\n");
@@ -211,6 +247,19 @@ int main(int argc, char *argv[]) {
                            pkt.seq_num, pkt.length, total_data_dropped,
                            100.0 * total_data_dropped / total_data_received);
                     continue;
+                }
+            }
+
+            /* DATA bit-corruption: flip 1 random byte in payload */
+            if (corrupt_rate > 0.0 && pkt.length > 0) {
+                double r = (double)rand() / (double)RAND_MAX;
+                if (r < corrupt_rate) {
+                    total_data_corrupted++;
+                    int byte_idx = rand() % pkt.length;
+                    pkt.payload[byte_idx] ^= 0xFF;  /* Invert all 8 bits in payload byte */
+                    printf("[EMULATOR CORRUPT] >>> CORRUPTED DATA: Seq=%u Len=%u "
+                           "(flipped payload byte %d, total corrupted: %lu)\n",
+                           pkt.seq_num, pkt.length, byte_idx, total_data_corrupted);
                 }
             }
 

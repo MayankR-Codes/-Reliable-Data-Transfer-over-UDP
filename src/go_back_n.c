@@ -188,6 +188,10 @@ int gbn_sender(const char *filepath, const char *dest_ip,
         while ((next_seq < base + (uint32_t)window_size) &&
                (next_seq < (uint32_t)total_chunks)) {
 
+            if (base == next_seq) {
+                timer_start = now_ms();
+            }
+
             Packet *p = &all_pkts[next_seq];
             p->seq_num  = next_seq;
             p->checksum = 0;
@@ -206,7 +210,7 @@ int gbn_sender(const char *filepath, const char *dest_ip,
         }
 
         /* ── (B) Send FIN if all data chunks are out ────────────── */
-        if (!fin_sent && next_seq >= (uint32_t)total_chunks) {
+        if (!fin_sent && base >= (uint32_t)total_chunks) {
             Packet fin_pkt;
             init_packet(&fin_pkt, PACKET_FIN, next_seq, 0, NULL, 0);
             send_packet(sockfd, &fin_pkt, &dest_addr);
@@ -274,7 +278,7 @@ int gbn_sender(const char *filepath, const char *dest_ip,
         }
 
         /* Retransmit FIN too if it was sent */
-        if (fin_sent) {
+        if (fin_sent && base >= (uint32_t)total_chunks) {
             Packet fin_pkt;
             init_packet(&fin_pkt, PACKET_FIN, next_seq, 0, NULL, 0);
             send_packet(sockfd, &fin_pkt, &dest_addr);
