@@ -165,6 +165,76 @@ static int run_gbn_transfer(int port, int window,
     return all_ok;
 }
 
+/* ── Run GBN transfer through emulator with simulated packet loss ── */
+static int run_gbn_transfer_with_loss(int emu_port, int recv_port, int loss_percent, int window,
+                                      const char *input_path, const char *output_path,
+                                      const char *input_hash)
+{
+    char label[128];
+    RecvArgs rargs = { recv_port, output_path, -99 };
+
+#ifdef _WIN32
+    HANDLE ht = (HANDLE)_beginthreadex(NULL, 0, gbn_recv_thread, &rargs, 0, NULL);
+    if (!ht) { fprintf(stderr, "[FATAL] Cannot start receiver.\n"); return 0; }
+    Sleep(300);
+
+    /* Launch emulator proxy process */
+    STARTUPINFO si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "emulator.exe --listen %d --recv-port %d --loss %d",
+             emu_port, recv_port, loss_percent);
+    if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "[FATAL] Cannot start emulator.\n");
+        return 0;
+    }
+    Sleep(400);
+#endif
+
+    printf("--- SENDER (N=%d over %d%% Loss) ---\n", window, loss_percent);
+    int sret = gbn_sender(input_path, "127.0.0.1", emu_port, window);
+    printf("--- END SENDER ---\n\n");
+
+#ifdef _WIN32
+    WaitForSingleObject(ht, 25000);
+    CloseHandle(ht);
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+#endif
+
+    int all_ok = 1;
+    int ok = (sret == 0) && (rargs.result == 0);
+    snprintf(label, sizeof(label),
+             "GBN 15%% loss recovery transfer completed (N=%d)", window);
+    banner(label, ok);
+    assert(ok);
+    all_ok &= ok;
+
+    char out_hash[SHA256_HEX_LEN];
+    int hash_ok = (compute_file_sha256(output_path, out_hash) == 0);
+    ok = hash_ok && (strcmp(input_hash, out_hash) == 0);
+    snprintf(label, sizeof(label),
+             "GBN 15%% loss SHA-256 data integrity (100%% identical)");
+    banner(label, ok);
+    assert(ok);
+    all_ok &= ok;
+
+    long out_sz = get_file_size(output_path);
+    ok = (out_sz == (long)GBN_TEST_SIZE);
+    snprintf(label, sizeof(label),
+             "GBN 15%% loss output size matches exactly (%ld bytes)", out_sz);
+    banner(label, ok);
+    assert(ok);
+    all_ok &= ok;
+
+    return all_ok;
+}
+
 /* ================================================================== */
 /*  main                                                               */
 /* ================================================================== */
@@ -224,11 +294,21 @@ int main(void) {
     printf("\n");
 
     /* ─────────────────────────────────────────────────────────── */
+    /* TEST 8+9: Day 4 Edge Case — GBN over 15% Packet Loss       */
+    /* ─────────────────────────────────────────────────────────── */
+    printf("[TEST 8/9] Manisha Day 4: GBN 15%% packet loss recovery (window N=8)\n\n");
+    ok = run_gbn_transfer_with_loss(19350, 19351, 15, 8,
+                                    GBN_INPUT_FILE, "test_data/gbn_out_loss15.bin",
+                                    input_hash);
+    all_passed &= ok;
+    printf("\n");
+
+    /* ─────────────────────────────────────────────────────────── */
     /* SUMMARY                                                    */
     /* ─────────────────────────────────────────────────────────── */
     printf("=======================================================\n");
     if (all_passed)
-        printf("  ALL GBN TESTS PASSED — Manisha Day 3 Complete!\n");
+        printf("  ALL GBN TESTS PASSED — Manisha Day 3 & Day 4 Complete!\n");
     else
         printf("  SOME TESTS FAILED — Review output above.\n");
     printf("=======================================================\n\n");
