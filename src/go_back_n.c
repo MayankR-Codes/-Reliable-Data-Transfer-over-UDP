@@ -404,16 +404,18 @@ int gbn_receiver(int listen_port, const char *output_path)
             } else {
                 /* ── Out-of-order: discard, re-ACK last good ───── */
                 discarded++;
-                printf("[DISCARD] Seq=%-5u (expected %u) — Re-ACK=%u\n",
-                       pkt.seq_num, expected_seq,
-                       expected_seq > 0 ? expected_seq - 1 : 0);
+                if (expected_seq > 0) {
+                    printf("[DISCARD] Seq=%-5u (expected %u) — Re-ACK=%u\n",
+                           pkt.seq_num, expected_seq, expected_seq - 1);
 
-                Packet ack;
-                uint32_t last_good = (expected_seq > 0)
-                                     ? expected_seq - 1 : 0;
-                init_packet(&ack, PACKET_ACK, 0, last_good, NULL, 0);
-                send_packet(sockfd, &ack, &sender_addr);
-                LOG_SEND_ACK(last_good);
+                    Packet ack;
+                    init_packet(&ack, PACKET_ACK, 0, expected_seq - 1, NULL, 0);
+                    send_packet(sockfd, &ack, &sender_addr);
+                    LOG_SEND_ACK(expected_seq - 1);
+                } else {
+                    printf("[DISCARD] Seq=%-5u (expected 0) — No packet ACKed yet\n",
+                           pkt.seq_num);
+                }
             }
         }
     }
