@@ -1,260 +1,455 @@
 # Reliable Data Transfer over UDP
 
-A complete, production-grade reliable file transfer system built from scratch on top of UDP sockets in C. The project implements application-layer transport reliability with **Stop-and-Wait (SW)**, **Go-Back-N (GBN)**, and **Selective Repeat (SR)** ARQ protocols, alongside an asynchronous **Network Channel Emulator** that simulates packet loss, latency delay, jitter, and bit corruption.
+An in-depth, production-quality implementation of transport-layer reliability mechanisms built completely from scratch in C over raw UDP sockets. This project implements, tests, and rigorously compares three foundational Automatic Repeat reQuest (ARQ) error-control protocols — **Stop-and-Wait (SW)**, **Go-Back-N (GBN)**, and **Selective Repeat (SR)** — while utilizing an integrated, configurable **Network Channel Emulator** that simulates real-world packet loss, transmission latency, and payload bit corruption.
 
 ---
 
-## 1. System Architecture
+## Table of Contents
+1. [Executive Summary & Educational Motivation](#1-executive-summary--educational-motivation)
+2. [How It Works: End-to-End File Journey](#2-how-it-works-end-to-end-file-journey)
+3. [System Architecture & Network Topology](#3-system-architecture--network-topology)
+4. [Custom Binary Packet Format & Wire Protocol](#4-custom-binary-packet-format--wire-protocol)
+5. [Comprehensive File-by-File Codebase Walkthrough](#5-comprehensive-file-by-file-codebase-walkthrough)
+6. [Team Roles & Work Division (According to WORK_DIVISION.md)](#6-team-roles--work-division)
+7. [Detailed Protocol Theory & State Machine Mechanics](#7-detailed-protocol-theory--state-machine-mechanics)
+   - [7.1 Stop-and-Wait (SW)](#71-stop-and-wait-sw)
+   - [7.2 Go-Back-N (GBN)](#72-go-back-n-gbn)
+   - [7.3 Selective Repeat (SR)](#73-selective-repeat-sr)
+8. [The Channel Emulator: Simulating Imperfect Networks](#8-the-channel-emulator-simulating-imperfect-networks)
+9. [Step-by-Step Compilation & Execution Guide](#9-step-by-step-compilation--execution-guide)
+10. [Live 3-Terminal Evaluation Demo & Output Explanations](#10-live-3-terminal-evaluation-demo)
+11. [Automated Unit & Integration Test Suite](#11-automated-unit--integration-test-suite)
+12. [Benchmark Analysis & Performance Comparison](#12-benchmark-analysis--performance-comparison)
+13. [Technical Viva & Evaluation Defense Cheat Sheet](#13-technical-viva--evaluation-defense-cheat-sheet)
+14. [Future Scope & Production Roadblocks](#14-future-scope--production-roadblocks)
+
+---
+
+## 1. Executive Summary & Educational Motivation
+
+In the TCP/IP stack, the Internet Protocol (IP) provides an unreliable, connectionless "best-effort" delivery service where datagrams may be lost, duplicated, delayed, or arrive out of sequence. To build applications requiring reliable transfers (such as file downloads, webpage rendering, or email delivery), higher layers must bridge this reliability gap.
+
+Modern systems use **TCP**, where reliability, flow control, and sliding window state machines run silently inside the OS kernel. This black-box abstraction makes it difficult for students and engineers to understand what actually happens when packets vanish in transit.
+
+**The Purpose of this Project:**
+- We deliberately bypass TCP by building on **raw User Datagram Protocol (UDP)** sockets.
+- UDP provides only process-to-process multiplexing via port numbers and an optional, basic 16-bit checksum.
+- By designing custom transport-layer headers, sequence numbering, timeouts, retransmission logic, cumulative/selective acknowledgments, and out-of-order buffers, we recreate transport reliability entirely in user-space in C.
+
+---
+
+## 2. How It Works: End-to-End File Journey
+
+The entire file transfer pipeline operates through distinct operational stages:
 
 ```text
-               +-------------------------------------------------+
-               |            Channel Emulator (Proxy)             |
-               |  --loss <%>  --delay <ms>  --corrupt <%>        |
-               |  - Asynchronous propagation delay queue         |
-               |  - CRC32 bit corruption & drop simulation       |
-               +-----------------------+-------------------------+
-                                       ^
-                           Forward     |      Forward
-                           DATA Pkts   |      ACK Pkts
-                                       v
-+------------------------+      UDP Datagrams        +------------------------+
-|       UDP Sender       +-------------------------->+      UDP Receiver      |
-|  ./sender.exe          |                           |  ./receiver.exe        |
-|  - File chunking (1KB) |<--------------------------+  - Packet validation   |
-|  - ARQ retransmission  |      Acknowledgements     |  - Out-of-order buffer |
-|  - 200ms socket timer  |       (Cum / Select)      |  - Circular receiver   |
-|  - SHA-256 hash verify |                           |  - File reassembly     |
-|                        |                           |  - SHA-256 hash verify |
-+------------------------+                           +------------------------+
+[Input File on Disk]
+       │
+       ▼ (Step 1: Segmentation)
+[1024-Byte Slices]
+       │
+       ▼ (Step 2: Encapsulation)
+[Custom Packets: Type + SeqNum + Payload + CRC32]
+       │
+       ▼ (Step 3: ARQ Sliding Window Dispatch)
+[UDP Socket sendto()]
+       │
+       ▼ (Step 4: Transit through Channel Emulator)
+[Probabilistic Drop / Delay / Bit Corruption]
+       │
+       ▼ (Step 5: Receiver Ingestion & Checksum Validation)
+[Verify CRC32 Integrity]
+   ├── Corrupted?  ──► Discard & Request Retransmit
+   └── Valid?      ──► Buffer or Write Contiguous Data
+                             │
+                             ▼ (Step 6: Reassembly)
+                     [Output File on Disk]
+                             │
+                             ▼ (Step 7: Hash Verification)
+                     [SHA-256(Input) == SHA-256(Output)]
+```
+
+1. **File Ingestion & Chunking:** The sender opens the target file in binary read mode (`"rb"`), reads chunks up to `1024 bytes` into memory, and computes an initial SHA-256 reference hash.
+2. **Encapsulation:** Each chunk is encapsulated into a `Packet` structure. The sender assigns a monotonic sequence number `seq_num`, writes the payload byte length, and computes a 32-bit CRC checksum across the complete struct.
+3. **Pipelined Transmission:** Depending on the chosen protocol (SW, GBN, or SR), the sender dispatches packets within its allowed window limit via UDP `sendto()`.
+4. **Channel Proxy Interception:** The datagrams arrive at the intermediate Channel Emulator (`emulator.exe`). The emulator rolls random numbers against user-specified probabilities:
+   - If `rand() < loss_rate`: Packet is dropped immediately without forwarding.
+   - If `rand() < corrupt_rate`: A random byte in the payload is inverted (`^= 0xFF`), invalidating the CRC32 checksum.
+   - If `delay_ms > 0`: The packet is held in a sleep state before being forwarded.
+5. **Receiver Validation & ACK Generation:** The receiver accepts the packet via `recvfrom()`:
+   - Validates the packet with `verify_packet_checksum()`.
+   - If corrupt, drops the packet and sends the appropriate duplicate or selective ACK.
+   - If valid, buffers the packet or writes it sequentially to disk, returning an ACK packet.
+6. **Connection Teardown:** Once all data chunks are transmitted, a `PACKET_FIN` handshake terminates the session cleanly.
+7. **Cryptographic Integrity Check:** Both source and destination files are hashed with SHA-256 to guarantee 100% bit-for-bit parity.
+
+---
+
+## 3. System Architecture & Network Topology
+
+The system uses an isolated 3-node proxy topology running over local or networked UDP sockets:
+
+```text
++-------------------------------------------------------------------------------+
+|                           CHANNEL EMULATOR (PROXY)                            |
+|                          Listens on Port: 8000 (UDP)                          |
+|                                                                               |
+|   Incoming Sender DATA ──────► [ RNG Loss Evaluator ] ──────► DROPPED!        |
+|                                         │ (If packet survives)                |
+|                                         ▼                                     |
+|                                [ RNG Corruptor ]                              |
+|                                         │                                     |
+|                                         ▼                                     |
+|                                 [ Latency Delay ]                             |
+|                                         │                                     |
+|                                         ▼                                     |
+|                           Forwarded to Port 9001 (Receiver)                   |
++-------------------------------------------------------------------------------+
+                 ▲                                             │
+   Forward DATA  │                               Forward DATA  │
+   (Port 8000)   │                               (Port 9001)   ▼
++-----------------------------+               +-----------------------------+
+|         UDP SENDER          |               |        UDP RECEIVER         |
+|         (sender.exe)        |               |       (receiver.exe)        |
+|                             |               |                             |
+|  - Chunks file into 1KB     |               |  - Listens on Port 9001     |
+|  - Maintains Window [N]     |  Reverse ACK  |  - Validates CRC32 Checksum |
+|  - Manages Socket Timers    |◄──────────────┤  - Out-of-order Buffering   |
+|  - Executes Retransmission  |  (via Proxy)  |  - Sequential File Writer   |
++-----------------------------+               +-----------------------------+
 ```
 
 ---
 
-## 2. Team Members & Module Ownership
+## 4. Custom Binary Packet Format & Wire Protocol
 
-| Member | Primary Ownership | Core Modules & Deliverables |
+The custom transport packet is defined in [`include/packet.h`](include/packet.h). It packs transport headers and payload into a contiguous struct:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  Packet Type  |           Reserved / Alignment Padding        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Sequence Number                        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Acknowledgment Number                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         Payload Length        |       Checksum (CRC-32)       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                     Checksum (Continued)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+|                   Payload Data (0 - 1024 Bytes)              |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+### Struct Field Specifications:
+1. `type` (`uint8_t`, 1 byte):
+   - `PACKET_DATA (1)`: Identifies a packet carrying application payload data.
+   - `PACKET_ACK  (2)`: Identifies a feedback control packet containing confirmation numbers.
+   - `PACKET_FIN  (3)`: Teardown packet signaling end-of-file transmission.
+2. `seq_num` (`uint32_t`, 4 bytes): Sequential identifier of the data chunk (starts at 0).
+3. `ack_num` (`uint32_t`, 4 bytes): Sequence number being acknowledged back to the sender.
+4. `length` (`uint16_t`, 2 bytes): Size of the valid payload in bytes (0 to 1024).
+5. `checksum` (`uint32_t`, 4 bytes): 32-bit CRC value. Calculated with `checksum = 0` during computation, then populated before transmission.
+6. `payload` (`char[1024]`, 1024 bytes): The raw binary chunk from the file.
+
+---
+
+## 5. Comprehensive File-by-File Codebase Walkthrough
+
+### Header Files (`include/`)
+
+- [`packet.h`](include/packet.h):
+  - **Purpose:** Declares the universal `Packet` structure, packet type enums, and prototypes for initializing packets (`init_packet`), calculating checksums (`compute_packet_checksum`), and verifying checksums (`verify_packet_checksum`).
+- [`socket_utils.h`](include/socket_utils.h):
+  - **Purpose:** Isolates platform-specific networking details. Handles Winsock initialization (`WSAStartup`) on Windows and POSIX headers on Linux. Declares wrappers for socket creation, binding, timeout setting (`set_socket_timeout`), and struct address management.
+- [`file_io.h`](include/file_io.h):
+  - **Purpose:** Defines the disk I/O interface. Declares functions to read chunks (`read_chunk`), write chunks sequentially (`write_chunk`), determine file size (`get_file_size`), and compute 256-bit cryptographic hashes (`compute_file_sha256`).
+- [`buffer.h`](include/buffer.h):
+  - **Purpose:** Houses windowing abstractions. Contains the definitions for sender window slots and the receiver circular buffer (`RecvBuffer`) utilized by Selective Repeat to hold out-of-order packets.
+- [`protocols.h`](include/protocols.h):
+  - **Purpose:** High-level protocol entry points. Declares sender and receiver prototypes for all three ARQ strategies (`sw_sender`, `sw_receiver`, `gbn_sender`, `gbn_receiver`, `sr_sender`, `sr_receiver`).
+
+---
+
+### Source Files (`src/`)
+
+- [`packet.c`](src/packet.c):
+  - **What it does:** Implements `init_packet()`, which clears memory, sets headers, copies the payload, and computes the CRC32 checksum.
+  - **How it works:** Implements a fast bitwise 32-bit Cyclic Redundancy Check (CRC32). When verifying, it zeroes out `pkt->checksum`, re-computes the CRC over the struct, and compares it against the transmitted value.
+- [`socket_utils.c`](src/socket_utils.c):
+  - **What it does:** Manages socket lifecycle. Initializes network subsystems, binds UDP sockets with `SO_REUSEADDR`, and wraps `sendto` and `recvfrom`.
+  - **How it works:** Configures socket timeouts via `setsockopt(..., SO_RCVTIMEO, ...)` allowing blocking calls to timeout cleanly after 200 ms without locking the process.
+- [`file_io.c`](src/file_io.c):
+  - **What it does:** Reads and writes raw binary chunks. Contains an embedded, self-contained implementation of the standard NIST FIPS 180-4 SHA-256 algorithm.
+  - **How it works:** Reads files in 1KB segments. After reception, computes the 64-character hexadecimal SHA-256 string for source and destination files to verify data integrity.
+- [`stop_and_wait.c`](src/stop_and_wait.c):
+  - **What it does:** Implements the classic Stop-and-Wait ARQ protocol.
+  - **How it works:**
+    - *Sender:* Sends one packet with alternating sequence number (0 or 1), sets a 200ms socket timeout, and waits for `PACKET_ACK`. On timeout, it retransmits the same packet up to 50 times.
+    - *Receiver:* Checks incoming packet checksum. If valid and matching expected sequence, writes to disk, flips expected sequence, and sends ACK. If duplicate, re-sends previous ACK.
+- [`go_back_n.c`](src/go_back_n.c):
+  - **What it does:** Implements the sliding window Go-Back-N protocol with cumulative acknowledgments.
+  - **How it works:**
+    - *Sender:* Maintains `base` (oldest unacknowledged packet) and `next_seq_num`. Transmits packets as long as `next_seq_num < base + window_size`. Uses a single base timer. If timeout occurs, it **retransmits all packets in the current window** from `base` to `next_seq_num - 1`.
+    - *Receiver:* Accepts packets strictly in-order (`seq_num == expected_seq`). Discards any out-of-order packet and re-sends a cumulative ACK for `expected_seq - 1`.
+- [`selective_repeat.c`](src/selective_repeat.c):
+  - **What it does:** Implements Selective Repeat ARQ with individual packet retransmission and out-of-order receiver buffering.
+  - **How it works:**
+    - *Sender:* Tracks sent time and ACK status for every packet individually in a window buffer. When a packet's individual 200ms timer expires, **only that specific packet is retransmitted**.
+    - *Receiver:* Implements a circular buffer of size $N$. Out-of-order packets falling inside $[rcv\_base, rcv\_base + N - 1]$ are stored in memory and selectively acknowledged. When `rcv_base` arrives, contiguous buffered chunks are written to disk and the window slides forward.
+- [`emulator.c`](src/emulator.c):
+  - **What it does:** Functions as an intentional network impairment proxy.
+  - **How it works:** Listens on port 8000 and forwards traffic to receiver port 9001. Randomly drops DATA packets based on `--loss`, inverts bits in payload based on `--corrupt`, and sleeps for `--delay` milliseconds before forwarding.
+- [`sender.c`](src/sender.c):
+  - **What it does:** User-facing CLI sender executable.
+  - **How it works:** Parses CLI arguments (`--file`, `--ip`, `--port`, `--protocol`, `--window`) and invokes the corresponding sender engine (`sw_sender`, `gbn_sender`, or `sr_sender`).
+- [`receiver.c`](src/receiver.c):
+  - **What it does:** User-facing CLI receiver executable.
+  - **How it works:** Parses CLI arguments (`--port`, `--output`, `--protocol`, `--window`) and executes the matching receiver engine.
+
+---
+
+## 6. Team Roles & Work Division
+
+According to the official project contract in [`WORK_DIVISION.md`](WORK_DIVISION.md), module ownership is structured as follows:
+
+| Member | Primary Ownership | Core Module Responsibilities & Contributions |
 | :--- | :--- | :--- |
-| **Mayank Rana** | **Channel Emulator, CLI Binaries, Benchmarks & Visualizations** | `src/emulator.c`, `src/sender.c`, `src/receiver.c`, `Makefile`, `scripts/benchmark.py`, `scripts/plot_results.py`, `README.md` |
-| **Dimple Mohapatra** | **Foundation, Packet Structure, File I/O & Buffers** | `include/packet.h`, `src/packet.c`, `include/socket_utils.h`, `src/socket_utils.c`, `include/file_io.h`, `src/file_io.c`, `include/buffer.h` |
-| **Manisha Behera** | **Stop-and-Wait & Go-Back-N Protocols** | `include/protocols.h`, `src/stop_and_wait.c`, `src/go_back_n.c`, sliding window cumulative ACKs |
-| **Raushan Kumar** | **Selective Repeat Protocol & Buffering** | `src/selective_repeat.c`, receiver circular buffer, per-packet timers & selective ACKs |
+| **Dimple Mohapatra** | **Foundation, Packet Structure, File I/O & Buffers** | Authored `packet.h`, `packet.c`, `socket_utils.h`, `socket_utils.c`, `file_io.h`, `file_io.c`, CRC32 checksum engine, NIST SHA-256 hashing utility, and receiver circular buffer structures in `buffer.h`. |
+| **Manisha Behera** | **Stop-and-Wait & Go-Back-N Protocols** | Designed and implemented `stop_and_wait.c`, `go_back_n.c`, alternating 1-bit sequence logic, GBN sliding window sender with cumulative ACK tracking, timeout recovery, and receiver in-order validation. |
+| **Raushan Kumar** | **Selective Repeat Protocol & Buffer Management** | Implemented `selective_repeat.c`, sender per-packet timer management, individual selective ACK handling, receiver out-of-order packet buffering, and in-order chunk flushing algorithms. |
+| **Mayank Rana** | **Channel Emulator, CLI Tools & Project Architecture** | Developed `emulator.c` impairment proxy, unified CLI binaries (`sender.c`, `receiver.c`), build configuration (`Makefile`), benchmark evaluation scripts, and technical documentation. |
 
 ---
 
-## 3. Supported ARQ Protocols
+## 7. Detailed Protocol Theory & State Machine Mechanics
 
-1. **Stop-and-Wait (SW):**
-   - 1-bit alternating sequence number ($0 \leftrightarrow 1$).
-   - Sender transmits 1 chunk and blocks waiting for ACK with a fixed 200 ms timeout (`SO_RCVTIMEO`).
-   - Ideal for low-latency, zero-loss links; throughput collapses when latency or loss is introduced.
+### 7.1 Stop-and-Wait (SW)
 
-2. **Go-Back-N (GBN):**
-   - Sliding window of size $N$ (e.g., $N=8$).
-   - Pipelined packet transmission using cumulative ACKs (`expected_seq`).
-   - Single base timer (200 ms). Upon timeout, retransmits the **entire unacknowledged window** $[base \dots next\_seq - 1]$.
-   - Receiver accepts strictly in-order packets; discards out-of-order packets and re-ACKs the last in-order sequence.
+```text
+SENDER                                    RECEIVER
+  │                                           │
+  │── [Seq 0, Data] ─────────────────────────►│ (Valid, write chunk)
+  │◄── [Ack 0] ───────────────────────────────│ (Expected flips to 1)
+  │                                           │
+  │── [Seq 1, Data] ──X (Dropped by Emulator) │
+  │   [200ms Timeout Fires!]                  │
+  │── [Seq 1, Data] (Retransmit) ────────────►│ (Valid, write chunk)
+  │◄── [Ack 1] ───────────────────────────────│ (Expected flips to 0)
+```
 
-3. **Selective Repeat (SR):**
-   - Sliding window of size $N$ with sequence number space $\ge 2N$.
-   - Independent per-packet 200 ms timer for every packet in flight.
-   - Receiver circular buffer stores out-of-order packets and returns individual selective ACKs.
-   - Retransmits **only** the specific packet that timed out, preventing redundant window retransmissions under loss.
-
----
-
-## 4. Channel Emulator Features
-
-The emulator (`emulator.exe`) acts as a UDP network proxy between sender and receiver:
-- `--listen <port>`: Proxy incoming UDP port (default: 8000).
-- `--recv-port <port>`: Forwarding destination port (default: 9001).
-- `--loss <percent>`: Probabilistic DATA packet drop rate (e.g., `--loss 15` for 15%).
-- `--loss-ack <percent>`: Independent ACK packet drop rate.
-- `--delay <ms>`: Artificial network latency added before forwarding packets.
-- `--jitter <ms>`: Random delay variation ($\pm jitter$ ms).
-- `--corrupt <percent>`: Bit corruption that randomly inverts bits in a payload byte, triggering CRC32 checksum mismatch at the receiver.
-- `--seed <number>`: Deterministic random seed for reproducible benchmark experiments.
+- **Sliding Window:** Size $N = 1$.
+- **Sequence Space:** 1-bit ($0$ and $1$).
+- **Channel Utilization:** Low. Throughput is bounded by the Round-Trip Time (RTT):
+  $$\text{Utilization} = \frac{T_{\text{trans}}}{T_{\text{trans}} + 2 \times T_{\text{prop}}}$$
+  As latency increases, the sender spends most of its time idle waiting for ACKs.
 
 ---
 
-## 5. Build & Compilation Instructions
+### 7.2 Go-Back-N (GBN)
 
-### Prerequisites
-- GCC Compiler (MinGW on Windows or GCC on Linux)
-- Python 3 with `matplotlib` (for automated benchmarks and plotting)
+```text
+SENDER (Window N=4)                       RECEIVER
+  │                                           │
+  │── [Seq 0] ───────────────────────────────►│ (Received, Ack 0)
+  │── [Seq 1] ──X (Dropped by Emulator)       │
+  │── [Seq 2] ───────────────────────────────►│ (Out-of-order! Discarded!)
+  │── [Seq 3] ───────────────────────────────►│ (Out-of-order! Discarded!)
+  │◄── [Ack 0] ───────────────────────────────│
+  │                                           │
+  │   [Timer for Seq 1 Expires!]              │
+  │   >>> Retransmit ENTIRE Window <<<        │
+  │── [Seq 1] ───────────────────────────────►│ (Received, Ack 1)
+  │── [Seq 2] ───────────────────────────────►│ (Received, Ack 2)
+  │── [Seq 3] ───────────────────────────────►│ (Received, Ack 3)
+```
+
+- **Sliding Window:** Sender window size $N$ (default 8). Receiver window size $= 1$.
+- **Sequence Constraint:** For $k$-bit sequence numbers, $N \le 2^k - 1$.
+- **Cumulative ACKs:** ACK $k$ confirms all packets up to $k$.
+- **Disadvantage:** A single dropped packet causes the receiver to discard all subsequent out-of-order packets, forcing the sender to retransmit the entire window and wasting bandwidth.
+
+---
+
+### 7.3 Selective Repeat (SR)
+
+```text
+SENDER (Window N=4)                       RECEIVER (Window N=4)
+  │                                           │
+  │── [Seq 0] ───────────────────────────────►│ (Received, Ack 0)
+  │── [Seq 1] ──X (Dropped by Emulator)       │
+  │── [Seq 2] ───────────────────────────────►│ (Buffered in slot 2, Ack 2)
+  │── [Seq 3] ───────────────────────────────►│ (Buffered in slot 3, Ack 3)
+  │◄── [Ack 0]                                │
+  │◄── [Ack 2]                                │
+  │◄── [Ack 3]                                │
+  │                                           │
+  │   [Timer for Seq 1 Expires!]              │
+  │   >>> Retransmit ONLY Packet 1 <<<        │
+  │── [Seq 1] ───────────────────────────────►│ (Received, Ack 1)
+  │                                           │ [Flush contiguous Seq 1,2,3 to disk]
+```
+
+- **Sliding Window:** Both sender and receiver maintain window size $N$.
+- **Sequence Constraint:** Sequence number space must be at least $2N$ ($N \le 2^{k-1}$) to prevent window overlap ambiguity.
+- **Selective ACKs:** ACK $k$ confirms only packet $k$.
+- **Advantage:** Only dropped packets are retransmitted, maintaining high throughput under lossy conditions.
+
+---
+
+## 8. The Channel Emulator: Simulating Imperfect Networks
+
+The emulator (`emulator.exe`) acts as a transparent network proxy:
+
+- `--listen <port>`: Local port where the emulator receives sender packets (default: 8000).
+- `--recv-port <port>`: Destination port where packets are forwarded (default: 9001).
+- `--loss <percent>`: Percentage of DATA packets dropped (e.g., `--loss 15` drops 15% of packets).
+- `--corrupt <percent>`: Percentage of DATA packets subjected to bit-inversion (flipped payload byte).
+- `--delay <ms>`: Delay applied before forwarding packets.
+
+---
+
+## 9. Step-by-Step Compilation & Execution Guide
 
 ### Compilation
-Build all binaries and test suites using `mingw32-make` (or `make`):
+Compile the entire project using `mingw32-make` (Windows) or `make` (Linux):
 ```bash
-# Build all production executables and test runners
 mingw32-make all
+```
 
-# Run the complete automated test suite (all 13 test executables)
+This compiles:
+- `sender.exe` (Unified sender CLI)
+- `receiver.exe` (Unified receiver CLI)
+- `emulator.exe` (Impairment proxy)
+- `test_*.exe` (Core unit and integration tests)
+
+To remove compiled binaries and object files:
+```bash
+mingw32-make clean
+```
+
+---
+
+## 10. Live 3-Terminal Evaluation Demo
+
+To demonstrate the full 3-node topology live during evaluation, open **three separate terminals**:
+
+### Terminal 1: Start Receiver
+```powershell
+.\receiver.exe --port 9001 --output test_data/demo_received.bin --protocol sr --window 8
+```
+*The receiver will bind to port 9001 and wait for packets.*
+
+### Terminal 2: Start Channel Emulator (15% Loss, 20ms Delay)
+```powershell
+.\emulator.exe --listen 8000 --recv-port 9001 --loss 15 --delay 20
+```
+*The emulator will proxy packets between port 8000 and 9001, dropping 15% of data packets.*
+
+### Terminal 3: Start Sender
+```powershell
+.\sender.exe --file test_data/benchmark_input.bin --ip 127.0.0.1 --port 8000 --protocol sr --window 8
+```
+*The sender will transmit the file via the emulator using Selective Repeat.*
+
+### Verify Cryptographic Integrity:
+```powershell
+certutil -hashfile test_data/benchmark_input.bin SHA256
+certutil -hashfile test_data/demo_received.bin SHA256
+```
+Both 64-character SHA-256 hashes will match **100% identically**, proving full data recovery.
+
+---
+
+## 11. Automated Unit & Integration Test Suite
+
+Run the automated test suite with:
+```bash
 mingw32-make test
 ```
 
-### Generated Binaries
-- `sender.exe` — Unified file sender CLI (supports `--protocol <sw|gbn|sr>`)
-- `receiver.exe` — Unified file receiver CLI (supports `--protocol <sw|gbn|sr>`)
-- `emulator.exe` — Network impairment proxy
-
----
-
-## 6. Complete Automated Test Suite (13 Tests)
-
-Every module is rigorously verified with dedicated unit and end-to-end integration tests:
-
-| Test Binary | Author / Day | Scope & Verification |
+| Test Executable | Module Verified | Scope & Verification |
 | :--- | :--- | :--- |
-| `test_packet.exe` | Manisha & Raushan (Day 1) | Checksum integrity, bit-flips, multi-byte corruptions, header tampering |
-| `test_loopback.exe` | Manisha & Raushan (Day 1) | UDP socket loopback, bi-directional ACK roundtrips, payload integrity |
-| `test_file_io.exe` | Dimple (Day 2) | 1KB chunk splitting, file reassembly, native SHA-256 hashing |
-| `test_emulator.exe` | Mayank (Day 2) | Proxy UDP datagram forwarding between client and server |
-| `test_loss.exe` | Mayank (Day 3) | Simulated 25% packet drop rate statistical accuracy |
-| `test_delay.exe` | Mayank (Day 3) | Artificial propagation delay (50 ms) & jitter verification |
-| `test_buffer.exe` | Dimple (Day 3 & 4) | Sender ring buffer & receiver circular buffer out-of-order slots |
-| `test_sw.exe` | Manisha & Raushan (Day 2) | Stop-and-Wait 5KB smoke test + 5MB file transfer (SHA-256 match) |
-| `test_gbn.exe` | Manisha (Day 3 & 4) | Go-Back-N lossless windowing (N=4, 8, 16) + 15% packet loss recovery |
-| `test_corrupt.exe` | Mayank (Day 4) | Bit-level payload corruption detection and retransmission |
-| `test_sr.exe` | Raushan (Day 4) | Selective Repeat windowing + 15% packet loss recovery with out-of-order buffering |
-| `test_stress.exe` | Manisha & Raushan (Day 5) | GBN & SR under severe impairments (20% loss + 10% corrupt + 20ms delay), zero deadlocks |
-| `test_delay_bench.exe` | Raushan (Day 3) | Side-by-side Stop-and-Wait vs. Go-Back-N delay throughput benchmark |
+| `test_packet.exe` | Checksum & Packet Layer | Verifies CRC32 calculation, single-bit flips, header tampering, and FIN frames. |
+| `test_loopback.exe`| UDP Socket Layer | Tests UDP transmission, socket binding, and bidirectional ACK roundtrips. |
+| `test_file_io.exe` | File I/O & SHA-256 | Tests 1KB chunking, file reassembly, and SHA-256 corruption detection. |
+| `test_sw.exe` | Stop-and-Wait Protocol | Runs full SW file transfer and verifies SHA-256 integrity match. |
+| `test_gbn.exe` | Go-Back-N Protocol | Tests windowing ($N=4, 8, 16$) and recovery under 15% packet loss. |
+| `test_sr.exe` | Selective Repeat Protocol | Tests out-of-order buffering and recovery under 15% packet loss. |
 
 ---
 
-## 7. Command-Line Reference
+## 12. Benchmark Analysis & Performance Comparison
 
-### Receiver CLI
-```bash
-./receiver.exe --port <port> --output <filepath> --protocol <sw|gbn|sr> [--window <N>]
-```
-- Example:
-  ```bash
-  ./receiver.exe --port 9001 --output received.bin --protocol sr --window 8
-  ```
+Benchmark results evaluating all three protocols on a 50 KB file across packet loss rates:
 
-### Channel Emulator CLI
-```bash
-./emulator.exe --listen <listen_port> --recv-port <recv_port> [--loss <%>] [--delay <ms>] [--corrupt <%>]
-```
-- Example (10% Loss, 20ms Delay, 5% Corruption):
-  ```bash
-  ./emulator.exe --listen 8000 --recv-port 9001 --loss 10 --delay 20 --corrupt 5
-  ```
-
-### Sender CLI
-```bash
-./sender.exe --file <filepath> --ip <dest_ip> --port <port> --protocol <sw|gbn|sr> [--window <N>]
-```
-- Example:
-  ```bash
-  ./sender.exe --file sample.bin --ip 127.0.0.1 --port 8000 --protocol sr --window 8
-  ```
-
----
-
-## 8. Live Demonstration Guide
-
-To demonstrate the full 3-node topology live during evaluation, open 3 terminal windows:
-
-**Terminal 1 — Receiver:**
-```bash
-./receiver.exe --port 9001 --output test_data/demo_out.bin --protocol sr --window 8
-```
-
-**Terminal 2 — Channel Emulator (15% Packet Loss, 20ms Delay):**
-```bash
-./emulator.exe --listen 8000 --recv-port 9001 --loss 15 --delay 20
-```
-
-**Terminal 3 — Sender:**
-```bash
-./sender.exe --file test_data/benchmark_input.bin --ip 127.0.0.1 --port 8000 --protocol sr --window 8
-```
-
-**Verify Cryptographic Integrity:**
-```bash
-certutil -hashfile test_data/benchmark_input.bin SHA256
-certutil -hashfile test_data/demo_out.bin SHA256
-```
-Both outputs will match identically.
-
----
-
-## 9. Benchmark Results & Comparative Analysis
-
-The automated benchmark suite (`mingw32-make benchmark`) evaluates all three protocols on a 50 KB file across packet loss rates from $0\%$ to $25\%$.
-
-### Summary Table
-
-| Protocol | Loss Rate (%) | Transfer Time (s) | Effective Goodput (KB/s) | Avg Retransmissions | SHA-256 Integrity |
+| Protocol | Loss Rate (%) | Transfer Time (s) | Effective Goodput (KB/s) | Retransmissions | SHA-256 Match |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Stop-and-Wait** | 0% | 1.60 s | 31.21 KB/s | 0.0 | **MATCH (100%)** |
-| **Stop-and-Wait** | 5% | 2.02 s | 24.80 KB/s | 2.0 | **MATCH (100%)** |
-| **Stop-and-Wait** | 10% | 2.73 s | 18.36 KB/s | 5.5 | **MATCH (100%)** |
-| **Stop-and-Wait** | 15% | 3.12 s | 16.02 KB/s | 7.5 | **MATCH (100%)** |
-| **Stop-and-Wait** | 20% | 4.35 s | 11.50 KB/s | 13.5 | **MATCH (100%)** |
-| **Stop-and-Wait** | 25% | 5.38 s | 9.39 KB/s | 18.5 | **MATCH (100%)** |
-| **Go-Back-N** | 0% | 0.25 s | **200.00 KB/s** | 0.0 | **MATCH (100%)** |
-| **Go-Back-N** | 5% | 0.45 s | 138.11 KB/s | 2.0 | **MATCH (100%)** |
-| **Go-Back-N** | 10% | 1.02 s | 49.97 KB/s | 7.0 | **MATCH (100%)** |
-| **Go-Back-N** | 15% | 1.77 s | 28.18 KB/s | 14.0 | **MATCH (100%)** |
-| **Go-Back-N** | 20% | 2.84 s | 18.04 KB/s | 24.0 | **MATCH (100%)** |
-| **Go-Back-N** | 25% | 3.98 s | 15.63 KB/s | 34.0 | **MATCH (100%)** |
-| **Selective Repeat** | 0% | 0.25 s | **200.00 KB/s** | 0.0 | **MATCH (100%)** |
-| **Selective Repeat** | 5% | 0.42 s | 118.48 KB/s | 2.5 | **MATCH (100%)** |
-| **Selective Repeat** | 10% | 0.72 s | **70.79 KB/s** | 4.5 | **MATCH (100%)** |
-| **Selective Repeat** | 15% | 1.32 s | **38.35 KB/s** | 9.0 | **MATCH (100%)** |
-| **Selective Repeat** | 20% | 1.73 s | **29.09 KB/s** | 12.5 | **MATCH (100%)** |
-| **Selective Repeat** | 25% | 2.58 s | **20.88 KB/s** | 25.5 | **MATCH (100%)** |
+| **Stop-and-Wait (SW)** | 0% | 1.60 s | 31.21 KB/s | 0.0 | **PASS (100%)** |
+| **Stop-and-Wait (SW)** | 10% | 2.73 s | 18.36 KB/s | 5.5 | **PASS (100%)** |
+| **Stop-and-Wait (SW)** | 25% | 5.38 s | 9.39 KB/s | 18.5 | **PASS (100%)** |
+| **Go-Back-N (GBN)** | 0% | 0.25 s | **200.00 KB/s** | 0.0 | **PASS (100%)** |
+| **Go-Back-N (GBN)** | 10% | 1.02 s | 49.97 KB/s | 7.0 | **PASS (100%)** |
+| **Go-Back-N (GBN)** | 25% | 3.98 s | 15.63 KB/s | 34.0 | **PASS (100%)** |
+| **Selective Repeat (SR)**| 0% | 0.25 s | **200.00 KB/s** | 0.0 | **PASS (100%)** |
+| **Selective Repeat (SR)**| 10% | 0.72 s | **70.79 KB/s** | 4.5 | **PASS (100%)** |
+| **Selective Repeat (SR)**| 25% | 2.58 s | **20.88 KB/s** | 25.5 | **PASS (100%)** |
+
+### Key Conclusions:
+1. **Pipelining Advantage (0% Loss):** GBN and SR achieve **200.00 KB/s** (**6.4x faster** than SW at 31.21 KB/s) by keeping multiple packets in flight.
+2. **Selective Retransmission Resilience (10% - 25% Loss):** At 25% loss, Selective Repeat maintains **20.88 KB/s** while GBN drops to **15.63 KB/s**. GBN causes 34 retransmissions due to window discarding, whereas Selective Repeat requires only 25.5 retransmissions.
 
 ---
 
-### Comparative Evaluation Visualizations
+## 13. Technical Viva & Evaluation Defense Cheat Sheet
 
-#### 1. Effective Goodput Comparison
-![Goodput Comparison](results/goodput_comparison.png)
-
-#### 2. Total Retransmissions Comparison
-![Retransmissions Comparison](results/retransmissions_comparison.png)
-
-#### 3. Transfer Time Comparison
-![Transfer Time Comparison](results/transfer_time_comparison.png)
-
----
-
-### Core Theoretical Conclusions
-1. **Pipelining Advantage (0% Loss):**
-   - Both Go-Back-N and Selective Repeat achieve **200.00 KB/s**, running **6.4x faster** than Stop-and-Wait (31.21 KB/s), proving that keeping $N=8$ packets in-flight saturates the channel bandwidth-delay product.
-2. **Selective Retransmission Resilience (10% – 25% Loss):**
-   - At 10% packet loss, Selective Repeat achieves **70.79 KB/s**, compared to GBN's **49.97 KB/s** and SW's **18.36 KB/s**.
-   - At 25% packet loss, Go-Back-N triggers **34 retransmissions** due to full window discarding, whereas Selective Repeat requires only **25.5 retransmissions**, maintaining higher goodput (**20.88 KB/s** vs. **15.63 KB/s**).
-3. **Half-Duplex Penalty in Stop-and-Wait:**
-   - Stop-and-Wait transfer time scales linearly with network delay and loss ($1.60\text{ s} \to 5.38\text{ s}$), because each packet loss incurs an idle 200 ms timeout period with zero packets in transit.
-
----
-
-## 10. Technical Viva Cheat Sheet
-
-### Dimple Mohapatra (Foundation, Packet Structure & Buffers)
-- **Q: Why implement reliability over UDP instead of TCP?**
-  - *A:* TCP handles reliability in the OS kernel. By implementing ARQ, sequencing, timeouts, and checksums over UDP at the application layer, we can control windowing mechanics, inject channel impairments, and benchmark protocol behavior.
-- **Q: Why use a 32-bit CRC checksum instead of the standard 16-bit UDP checksum?**
-  - *A:* UDP checksums are optional on some IPv4 stacks and only 16 bits. CRC32 provides stronger Hamming distance error detection against bit corruptions simulated by our channel proxy.
+### Dimple Mohapatra (Foundation & Packet Layer)
+- **Q: Why use UDP instead of raw sockets or TCP?**
+  - *Answer:* Raw sockets require administrative privileges and manual IP framing. TCP implements reliability inside the kernel. UDP provides port multiplexing while letting us implement ARQ protocols entirely in user-space.
+- **Q: Why is CRC32 needed if UDP already has a checksum?**
+  - *Answer:* Standard UDP checksums are only 16 bits and optional on some IPv4 configurations. Our 32-bit CRC detects payload bit corruptions with a much stronger Hamming distance.
 
 ### Manisha Behera (Stop-and-Wait & Go-Back-N)
-- **Q: Why does Go-Back-N performance degrade steeply under high packet loss?**
-  - *A:* GBN uses cumulative ACKs. If packet $k$ is lost, the receiver discards all subsequent packets ($k+1, \dots, k+N-1$), forcing the sender to retransmit the entire window from $k$ onwards, multiplying retransmissions.
-- **Q: What is the sequence number requirement for Go-Back-N?**
-  - *A:* For a window size $N$, sequence numbers must satisfy $N \le 2^k - 1$ to avoid window overlap ambiguity.
+- **Q: Why does Go-Back-N throughput drop steeply under packet loss?**
+  - *Answer:* GBN uses cumulative ACKs. If packet $k$ is lost, the receiver discards all subsequent packets ($k+1, \dots, k+N-1$), forcing the sender to retransmit the entire window from $k$ onwards.
+- **Q: What is the sequence number requirement for GBN?**
+  - *Answer:* For window size $N$, sequence numbers must satisfy $N \le 2^k - 1$ to prevent window overlap ambiguity.
 
-### Raushan Kumar (Selective Repeat & Out-of-Order Buffering)
+### Raushan Kumar (Selective Repeat & Buffering)
 - **Q: How does Selective Repeat prevent redundant retransmissions?**
-  - *A:* The receiver maintains a circular buffer to accept and hold out-of-order packets. It acknowledges packets individually with selective ACKs. The sender tracks timers per packet and retransmits only the specific packet that timed out.
+  - *Answer:* The receiver buffers out-of-order packets and returns individual selective ACKs. The sender tracks timers per packet and retransmits only the specific packet that timed out.
 - **Q: Why does Selective Repeat require sequence number space $\ge 2N$?**
-  - *A:* If sequence space is $< 2N$, a delayed ACK from the previous window could be misinterpreted as an ACK for a packet in the new window, causing data corruption.
+  - *Answer:* If sequence space is $< 2N$, a delayed ACK from the previous window could be misinterpreted as an ACK for a packet in the new window, causing data corruption.
 
 ### Mayank Rana (Channel Emulator & Benchmarks)
-- **Q: How does the channel emulator simulate network latency without slowing down the host?**
-  - *A:* The emulator uses an asynchronous event-driven delay queue with non-blocking `select()`. Incoming datagrams are stamped with departure deadlines (`now + delay`) and queued without blocking subsequent packet receptions.
+- **Q: How does the emulator drop packets without kernel modifications?**
+  - *Answer:* It acts as a UDP application proxy. It intercepts datagrams on a listen port, rolls a random number against the loss probability, and either drops the packet or forwards it to the destination.
 - **Q: What does the Goodput vs. Loss graph demonstrate?**
-  - *A:* At 0% loss, sliding window protocols maximize throughput. As loss rates increase, Selective Repeat outperforms Go-Back-N because its retransmissions scale linearly with packet loss, whereas GBN's retransmissions multiply with window size.
+  - *Answer:* At 0% loss, sliding window protocols maximize throughput. As loss rates increase, Selective Repeat outperforms Go-Back-N because its retransmissions scale linearly with packet loss, whereas GBN's retransmissions multiply with window size.
+
+---
+
+## 14. Future Scope & Production Roadblocks
+
+While the project implements a complete ARQ transport framework, several advanced enhancements could be pursued in future work:
+
+1. **Adaptive Retransmission Timeout (Jacobson/Karels Algorithm):**
+   - *Current:* Fixed 200 ms socket timer.
+   - *Improvement:* Dynamically calculate Smooth Round Trip Time (SRTT) and variance (RTTVAR) to adapt timeout to network conditions:
+     $$\text{RTO} = \text{SRTT} + 4 \times \text{RTTVAR}$$
+2. **TCP-Style Congestion Control (Tahoe / Reno):**
+   - *Current:* Fixed window size $N$.
+   - *Improvement:* Implement Slow Start, Congestion Avoidance, and Fast Retransmit/Recovery with dynamic `cwnd` scaling based on packet loss feedback.
+3. **Cumulative + Selective Hybrid (SACK):**
+   - *Current:* Pure cumulative ACKs for GBN, pure single ACKs for SR.
+   - *Improvement:* Implement Selective Acknowledgments (RFC 2018) carrying a cumulative ACK base alongside SACK blocks indicating non-contiguous chunks.
+4. **Bidirectional Full-Duplex Piggybacking:**
+   - *Current:* Unidirectional file flow with reverse ACK packets.
+   - *Improvement:* Enable simultaneous two-way file transfers where ACK numbers are piggybacked directly inside outgoing DATA packet headers.
+5. **High-Performance Non-Cryptographic Hashing:**
+   - *Current:* Standard SHA-256 for file verification.
+   - *Improvement:* Integrate ultra-fast hashing algorithms like **BLAKE3** or **xxHash** for multi-gigabit transfers where cryptographic security is secondary to hashing speed.

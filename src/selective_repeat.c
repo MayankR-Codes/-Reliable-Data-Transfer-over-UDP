@@ -26,7 +26,6 @@
 
 #include "protocols.h"
 #include "buffer.h"
-#include "log_utils.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -147,9 +146,10 @@ int sr_sender(const char *filepath, const char *dest_ip,
             long long now = sr_now_ms();
             wbuf_push(&wb, &chunks[next_to_send], now);
             send_packet(sockfd, &chunks[next_to_send], &dest_addr);
-            LOG_SEND(chunks[next_to_send].seq_num,
-                     chunks[next_to_send].length,
-                     chunks[next_to_send].checksum);
+            printf("[SEND] Seq=%-5u Length=%-4u Checksum=0x%08X\n",
+                   chunks[next_to_send].seq_num,
+                   chunks[next_to_send].length,
+                   chunks[next_to_send].checksum);
             next_to_send++;
         }
 
@@ -162,7 +162,7 @@ int sr_sender(const char *filepath, const char *dest_ip,
                     /* Retransmit ONLY this individual timed-out packet */
                     slot->sent_time_ms = current_time;
                     retransmits++;
-                    LOG_TIMEOUT(slot->seq_num);
+                    printf("[TIMEOUT] Packet=%-5u Retransmitting...\n", slot->seq_num);
                     send_packet(sockfd, &slot->pkt, &dest_addr);
                 }
             }
@@ -176,12 +176,12 @@ int sr_sender(const char *filepath, const char *dest_ip,
         if (recvd > 0) {
             consecutive_idle = 0;
             if (!verify_packet_checksum(&ack_pkt)) {
-                LOG_CORRUPT(ack_pkt.ack_num, "Checksum mismatch");
+                printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", ack_pkt.ack_num);
                 continue;
             }
             if (ack_pkt.type == PACKET_ACK) {
                 uint32_t ack_num = ack_pkt.ack_num;
-                LOG_RECV_ACK(ack_num, 1);
+                printf("[RECV] Ack=%-5u Valid=YES\n", ack_num);
                 wbuf_selective_ack(&wb, ack_num);
             }
         } else {
@@ -199,13 +199,13 @@ int sr_sender(const char *filepath, const char *dest_ip,
 
     set_socket_timeout(sockfd, 200);
     for (int attempt = 0; attempt < 20; attempt++) {
-        LOG_SEND_FIN(fin_pkt.seq_num);
+        printf("[SEND] FIN  Seq=%-5u\n", fin_pkt.seq_num);
         send_packet(sockfd, &fin_pkt, &dest_addr);
 
         struct sockaddr_in from_addr;
         int b = recv_packet(sockfd, &fin_ack, &from_addr);
         if (b > 0 && verify_packet_checksum(&fin_ack) && fin_ack.type == PACKET_ACK) {
-            LOG_RECV_ACK(fin_ack.ack_num, 1);
+            printf("[RECV] Ack=%-5u Valid=YES\n", fin_ack.ack_num);
             printf("\n[SR-SENDER] FIN acknowledged. Transfer complete.\n");
             break;
         }
@@ -277,7 +277,7 @@ int sr_receiver(int listen_port, const char *output_path)
         /* Corrupted packet detection */
         if (!verify_packet_checksum(&rx_pkt)) {
             corrupt_pkts++;
-            LOG_CORRUPT(rx_pkt.seq_num, "Checksum mismatch");
+            printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", rx_pkt.seq_num);
             continue;
         }
 
@@ -287,7 +287,7 @@ int sr_receiver(int listen_port, const char *output_path)
             Packet fin_ack;
             init_packet(&fin_ack, PACKET_ACK, 0, rx_pkt.seq_num, NULL, 0);
             send_packet(sockfd, &fin_ack, &sender_addr);
-            LOG_SEND_ACK(rx_pkt.seq_num);
+            printf("[SEND] Ack=%-5u\n", rx_pkt.seq_num);
             break;
         }
 
@@ -297,7 +297,7 @@ int sr_receiver(int listen_port, const char *output_path)
 
         /* Case 1: Packet within receive window [rcv_base, rcv_base + window_size) */
         if (rbuf_is_in_window(&rbuf, seq)) {
-            LOG_RECV_DATA(seq, rx_pkt.length, 1);
+            printf("[RECV] Seq=%-5u Length=%-4u Valid=YES\n", seq, rx_pkt.length);
             if (seq != rbuf.rcv_base && !rbuf_is_buffered(&rbuf, seq)) {
                 out_of_order++;
             }
@@ -309,7 +309,7 @@ int sr_receiver(int listen_port, const char *output_path)
             Packet ack;
             init_packet(&ack, PACKET_ACK, 0, seq, NULL, 0);
             send_packet(sockfd, &ack, &sender_addr);
-            LOG_SEND_ACK(seq);
+            printf("[SEND] Ack=%-5u\n", seq);
 
             /* Flush contiguous packets if base slot is filled */
             rbuf_flush_contiguous(&rbuf, fp, &bytes_written, &chunks_written);
@@ -320,7 +320,7 @@ int sr_receiver(int listen_port, const char *output_path)
             Packet ack;
             init_packet(&ack, PACKET_ACK, 0, seq, NULL, 0);
             send_packet(sockfd, &ack, &sender_addr);
-            LOG_SEND_ACK(seq);
+            printf("[SEND] Ack=%-5u\n", seq);
         }
     }
 
