@@ -32,7 +32,6 @@
 
 #include "protocols.h"
 #include "buffer.h"
-#include "log_utils.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -205,7 +204,8 @@ int gbn_sender(const char *filepath, const char *dest_ip,
                         next_seq);
                 ret = -1; goto done;
             }
-            LOG_SEND(p->seq_num, p->length, p->checksum);
+            printf("[SEND] Seq=%-5u Length=%-4u Checksum=0x%08X\n",
+                   p->seq_num, p->length, p->checksum);
             next_seq++;
         }
 
@@ -214,7 +214,7 @@ int gbn_sender(const char *filepath, const char *dest_ip,
             Packet fin_pkt;
             init_packet(&fin_pkt, PACKET_FIN, next_seq, 0, NULL, 0);
             send_packet(sockfd, &fin_pkt, &dest_addr);
-            LOG_SEND_FIN(next_seq);
+            printf("[SEND] FIN  Seq=%-5u\n", next_seq);
             fin_sent = 1;
         }
 
@@ -228,14 +228,14 @@ int gbn_sender(const char *filepath, const char *dest_ip,
         if (rlen > 0) {
             /* Received something — validate */
             if (!verify_packet_checksum(&ack_pkt)) {
-                LOG_CORRUPT(ack_pkt.ack_num, "Checksum mismatch");
+                printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", ack_pkt.ack_num);
                 /* Don't reset timer; let it fire naturally */
                 continue;
             }
 
             if (ack_pkt.type == PACKET_ACK) {
                 uint32_t acked = ack_pkt.ack_num;
-                LOG_RECV_ACK(acked, 1);
+                printf("[RECV] Ack=%-5u Valid=YES\n", acked);
 
                 /* FIN-ACK? */
                 if (fin_sent && acked == next_seq) {
@@ -266,7 +266,6 @@ int gbn_sender(const char *filepath, const char *dest_ip,
             ret = -1; break;
         }
 
-        LOG_TIMEOUT(base);
         printf("[TIMEOUT] base=%u next=%u — Retransmitting window "
                "[%u .. %u]\n", base, next_seq, base, next_seq - 1);
 
@@ -357,13 +356,13 @@ int gbn_receiver(int listen_port, const char *output_path)
         /* ── Checksum validation ────────────────────────────────── */
         if (!verify_packet_checksum(&pkt)) {
             corrupted++;
-            LOG_CORRUPT(pkt.seq_num, "Checksum mismatch");
+            printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", pkt.seq_num);
             /* Re-ACK the last good cumulative sequence */
             if (expected_seq > 0) {
                 Packet ack;
                 init_packet(&ack, PACKET_ACK, 0, expected_seq - 1, NULL, 0);
                 send_packet(sockfd, &ack, &sender_addr);
-                LOG_SEND_ACK(expected_seq - 1);
+                printf("[SEND] Ack=%-5u\n", expected_seq - 1);
             }
             continue;
         }
@@ -374,7 +373,7 @@ int gbn_receiver(int listen_port, const char *output_path)
             Packet fin_ack;
             init_packet(&fin_ack, PACKET_ACK, 0, pkt.seq_num, NULL, 0);
             send_packet(sockfd, &fin_ack, &sender_addr);
-            LOG_SEND_ACK(pkt.seq_num);
+            printf("[SEND] Ack=%-5u\n", pkt.seq_num);
             break;
         }
 
@@ -392,12 +391,12 @@ int gbn_receiver(int listen_port, const char *output_path)
 
                 bytes_recv += pkt.length;
                 chunks_recv++;
-                LOG_RECV_DATA(pkt.seq_num, pkt.length, 1);
+                printf("[RECV] Seq=%-5u Length=%-4u Valid=YES\n", pkt.seq_num, pkt.length);
 
                 Packet ack;
                 init_packet(&ack, PACKET_ACK, 0, expected_seq, NULL, 0);
                 send_packet(sockfd, &ack, &sender_addr);
-                LOG_SEND_ACK(expected_seq);
+                printf("[SEND] Ack=%-5u\n", expected_seq);
 
                 expected_seq++;
 
@@ -411,7 +410,7 @@ int gbn_receiver(int listen_port, const char *output_path)
                     Packet ack;
                     init_packet(&ack, PACKET_ACK, 0, expected_seq - 1, NULL, 0);
                     send_packet(sockfd, &ack, &sender_addr);
-                    LOG_SEND_ACK(expected_seq - 1);
+                    printf("[SEND] Ack=%-5u\n", expected_seq - 1);
                 } else {
                     printf("[DISCARD] Seq=%-5u (expected 0) — No packet ACKed yet\n",
                            pkt.seq_num);

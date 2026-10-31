@@ -23,7 +23,6 @@
  */
 
 #include "protocols.h"
-#include "log_utils.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -109,11 +108,13 @@ int sw_sender(const char *filepath, const char *dest_ip, int dest_port)
 
             if (pkt.type == PACKET_DATA) {
                 if (tries == 0)
-                    LOG_SEND(pkt.seq_num, pkt.length, pkt.checksum);
+                    printf("[SEND] Seq=%-5u Length=%-4u Checksum=0x%08X\n",
+                           pkt.seq_num, pkt.length, pkt.checksum);
                 else
-                    LOG_TIMEOUT_ATTEMPT(pkt.seq_num, tries + 1);
+                    printf("[TIMEOUT] Packet=%-5u Retransmitting... (attempt %d)\n",
+                           pkt.seq_num, tries + 1);
             } else {
-                LOG_SEND_FIN(pkt.seq_num);
+                printf("[SEND] FIN  Seq=%-5u\n", pkt.seq_num);
             }
 
             /* Wait for ACK */
@@ -130,7 +131,7 @@ int sw_sender(const char *filepath, const char *dest_ip, int dest_port)
 
             /* Validate ACK */
             if (!verify_packet_checksum(&ack_pkt)) {
-                LOG_CORRUPT(ack_pkt.ack_num, "Checksum mismatch");
+                printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", ack_pkt.ack_num);
                 tries++;
                 retransmits++;
                 continue;
@@ -138,7 +139,7 @@ int sw_sender(const char *filepath, const char *dest_ip, int dest_port)
 
             if (ack_pkt.type == PACKET_ACK && ack_pkt.ack_num == seq_num) {
                 /* ── Correct ACK ──────────────────────────────── */
-                LOG_RECV_ACK(ack_pkt.ack_num, 1);
+                printf("[RECV] Ack=%-5u Valid=YES\n", ack_pkt.ack_num);
                 acked = 1;
             } else {
                 /* Stale / duplicate ACK — retransmit */
@@ -238,14 +239,14 @@ int sw_receiver(int listen_port, const char *output_path)
         /* ── Checksum validation ──────────────────────────────── */
         if (!verify_packet_checksum(&pkt)) {
             corrupted++;
-            LOG_CORRUPT(pkt.seq_num, "Checksum mismatch");
+            printf("[CORRUPT] Packet=%-5u Discarded (Checksum mismatch)\n", pkt.seq_num);
 
             /* Re-ACK the last successfully received packet */
             Packet ack;
             uint32_t last_good = expected_seq ^ 1;   /* previous seq */
             init_packet(&ack, PACKET_ACK, 0, last_good, NULL, 0);
             send_packet(sockfd, &ack, &sender_addr);
-            LOG_SEND_ACK(last_good);
+            printf("[SEND] Ack=%-5u\n", last_good);
             continue;
         }
 
@@ -255,7 +256,7 @@ int sw_receiver(int listen_port, const char *output_path)
             Packet fin_ack;
             init_packet(&fin_ack, PACKET_ACK, 0, pkt.seq_num, NULL, 0);
             send_packet(sockfd, &fin_ack, &sender_addr);
-            LOG_SEND_ACK(pkt.seq_num);
+            printf("[SEND] Ack=%-5u\n", pkt.seq_num);
             break;
         }
 
@@ -273,12 +274,12 @@ int sw_receiver(int listen_port, const char *output_path)
 
                 bytes_recv += pkt.length;
                 chunks_recv++;
-                LOG_RECV_DATA(pkt.seq_num, pkt.length, 1);
+                printf("[RECV] Seq=%-5u Length=%-4u Valid=YES\n", pkt.seq_num, pkt.length);
 
                 Packet ack;
                 init_packet(&ack, PACKET_ACK, 0, pkt.seq_num, NULL, 0);
                 send_packet(sockfd, &ack, &sender_addr);
-                LOG_SEND_ACK(pkt.seq_num);
+                printf("[SEND] Ack=%-5u\n", pkt.seq_num);
 
                 expected_seq ^= 1;   /* toggle expected: 0 ↔ 1 */
 
@@ -292,7 +293,7 @@ int sw_receiver(int listen_port, const char *output_path)
                 Packet ack;
                 init_packet(&ack, PACKET_ACK, 0, last_good, NULL, 0);
                 send_packet(sockfd, &ack, &sender_addr);
-                LOG_SEND_ACK(last_good);
+                printf("[SEND] Ack=%-5u\n", last_good);
             }
         }
     }
